@@ -75,16 +75,38 @@ jobs:
           docker-images: true
           swap-storage: true
 
-      - name: Install Rust cross-build dependencies (clang-cl, lld-link, xwin)
+      - name: Install Rust cross-build dependencies (clang-cl, lld-link, xwin 0.10.0)
         if: steps.rust-cache.outputs.cache-hit != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y clang lld llvm cmake ninja-build curl xz-utils zstd python3 git
-          # Install lightweight xwin binary so Rust std links against Windows SDK/CRT libs
-          XWIN_VER="0.6.5"
+          # xwin 0.10.0+ fixes Microsoft's VS 17/18 manifest path-separator & onecore-uap header changes
+          XWIN_VER="0.10.0"
           curl -fsSL "https://github.com/Jake-Shadle/xwin/releases/download/${XWIN_VER}/xwin-${XWIN_VER}-x86_64-unknown-linux-musl.tar.gz" \
             | tar -xz --strip-components=1 -C /tmp "xwin-${XWIN_VER}-x86_64-unknown-linux-musl/xwin"
           /tmp/xwin --accept-license --arch x86_64 splat --output /tmp/xwin-sysroot
+          rm -rf .xwin-cache /tmp/xwin
+
+          # Wrapper scripts guarantee x.py always passes xwin include/lib paths at every bootstrap stage
+          cat > /tmp/clang-cl-xwin <<'WRAP'
+          #!/usr/bin/env bash
+          exec clang-cl \
+            -Wno-unused-command-line-argument \
+            /imsvc/tmp/xwin-sysroot/crt/include \
+            /imsvc/tmp/xwin-sysroot/sdk/include/ucrt \
+            /imsvc/tmp/xwin-sysroot/sdk/include/um \
+            /imsvc/tmp/xwin-sysroot/sdk/include/shared \
+            "$@"
+          WRAP
+          cat > /tmp/lld-link-xwin <<'WRAP'
+          #!/usr/bin/env bash
+          exec lld-link \
+            /libpath:/tmp/xwin-sysroot/crt/lib/x86_64 \
+            /libpath:/tmp/xwin-sysroot/sdk/lib/um/x86_64 \
+            /libpath:/tmp/xwin-sysroot/sdk/lib/ucrt/x86_64 \
+            "$@"
+          WRAP
+          chmod +x /tmp/clang-cl-xwin /tmp/lld-link-xwin
 
       - name: Clone, patch, and build Win7-compatible Rust toolchain
         if: steps.rust-cache.outputs.cache-hit != 'true'
@@ -114,13 +136,13 @@ jobs:
           sysconfdir = "etc"
 
           [target.x86_64-pc-windows-msvc]
-          cc = "clang-cl"
-          cxx = "clang-cl"
+          cc = "/tmp/clang-cl-xwin"
+          cxx = "/tmp/clang-cl-xwin"
           ar = "llvm-lib"
-          linker = "lld-link"
+          linker = "/tmp/lld-link-xwin"
           EOF
 
-          export RUSTFLAGS="-L native=/tmp/xwin-sysroot/crt/lib/x86_64 -L native=/tmp/xwin-sysroot/sdk/lib/um/x86_64 -L native=/tmp/xwin-sysroot/sdk/lib/ucrt/x86_64"
+          export CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER="/tmp/lld-link-xwin"
           cd /tmp/rust-src
           python3 x.py install compiler library cargo
 
