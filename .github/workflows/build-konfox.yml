@@ -1,0 +1,227 @@
+name: Build Könfox Nightly (Win7 SP1 x64)
+
+on:
+  workflow_dispatch:
+    inputs:
+      firefox_ref:
+        description: "mozilla-firefox/firefox branch or commit (default: main = Nightly)"
+        required: true
+        default: "main"
+      rust_version:
+        description: "Rust version override (leave blank to auto-detect from Nightly)"
+        required: false
+        default: ""
+      create_release:
+        description: "Automatically publish a GitHub Release with the .installer.exe & .zip"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  # ===========================================================================
+  # Job 1: Build & cache the Win7-patched Linux->Windows Rust toolchain
+  # Runs on FREE GitHub-hosted ubuntu-24.04 (4 vCPU, 16 GB RAM on public repos)
+  # ===========================================================================
+  build-patched-rust:
+    name: Build & Cache Win7-Patched Rust
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    outputs:
+      rust_version: ${{ steps.detect.outputs.rust_version }}
+      cache_key: ${{ steps.detect.outputs.cache_key }}
+
+    steps:
+      - name: Checkout Könfox build toolkit
+        uses: actions/checkout@v4
+
+      - name: Run Könfox self-tests
+        run: python3 tests/test_konfox_toolchain.py
+
+      - name: Auto-detect required Rust version from Firefox Nightly
+        id: detect
+        run: |
+          if [ -n "${{ inputs.rust_version }}" ]; then
+            RV="${{ inputs.rust_version }}"
+          else
+            RV=$(curl -fsSL "https://raw.githubusercontent.com/mozilla-firefox/firefox/${{ inputs.firefox_ref }}/docs/writing-rust-code/update-policy.md" | python3 -c '
+          import re, sys
+          versions = re.findall(r"\|\s*Firefox\s+\d+\s*\|\s*Rust\s+([0-9]+\.[0-9]+\.[0-9]+)", sys.stdin.read())
+          print(versions[-1] if versions else "1.100.0")
+          ')
+          fi
+          echo "Detected Rust version: $RV"
+          echo "rust_version=$RV" >> "$GITHUB_OUTPUT"
+          echo "cache_key=konfox-rust-win7-${RV}-v1" >> "$GITHUB_OUTPUT"
+
+      - name: Check cache for prebuilt Win7-patched Rust toolchain
+        id: rust-cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/rust-win7-cache
+          key: ${{ steps.detect.outputs.cache_key }}
+
+      - name: Free runner disk space (~40+ GB)
+        if: steps.rust-cache.outputs.cache-hit != 'true'
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Install Rust cross-build dependencies (clang-cl, lld-link, xwin)
+        if: steps.rust-cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld llvm cmake ninja-build curl xz-utils zstd python3 git
+          # Install lightweight xwin binary so Rust std links against Windows SDK/CRT libs
+          XWIN_VER="0.6.5"
+          curl -fsSL "https://github.com/Jake-Shadle/xwin/releases/download/${XWIN_VER}/xwin-${XWIN_VER}-x86_64-unknown-linux-musl.tar.gz" \
+            | tar -xz --strip-components=1 -C /tmp "xwin-${XWIN_VER}-x86_64-unknown-linux-musl/xwin"
+          /tmp/xwin --accept-license --arch x86_64 splat --output /tmp/xwin-sysroot
+
+      - name: Clone, patch, and build Win7-compatible Rust toolchain
+        if: steps.rust-cache.outputs.cache-hit != 'true'
+        run: |
+          RV="${{ steps.detect.outputs.rust_version }}"
+          git clone --depth 1 --branch "$RV" https://github.com/rust-lang/rust.git /tmp/rust-src
+          git -C /tmp/rust-src submodule update --init --recursive --depth 1
+
+          python3 scripts/patch_rust_win7.py --strict /tmp/rust-src
+
+          cat > /tmp/rust-src/bootstrap.toml <<'EOF'
+          profile = "compiler"
+          change-id = "ignore"
+
+          [llvm]
+          download-ci-llvm = true
+
+          [build]
+          host = ["x86_64-unknown-linux-gnu"]
+          target = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+          docs = false
+          extended = true
+          tools = ["cargo"]
+
+          [install]
+          prefix = "/tmp/rust-win7-dist"
+          sysconfdir = "etc"
+
+          [target.x86_64-pc-windows-msvc]
+          cc = "clang-cl"
+          cxx = "clang-cl"
+          ar = "llvm-lib"
+          linker = "lld-link"
+          EOF
+
+          export RUSTFLAGS="-L native=/tmp/xwin-sysroot/crt/lib/x86_64 -L native=/tmp/xwin-sysroot/sdk/lib/um/x86_64 -L native=/tmp/xwin-sysroot/sdk/lib/ucrt/x86_64"
+          cd /tmp/rust-src
+          python3 x.py install compiler library cargo
+
+          mkdir -p /tmp/rust-win7-cache
+          tar --zstd -cf /tmp/rust-win7-cache/rust-win7-toolchain.tar.zst -C /tmp/rust-win7-dist .
+          ls -lh /tmp/rust-win7-cache/rust-win7-toolchain.tar.zst
+
+  # ===========================================================================
+  # Job 2: Cross-compile Könfox Nightly (Win7 SP1 x64), audit PEs, package .exe
+  # ===========================================================================
+  build-konfox-installer:
+    name: Build Könfox Nightly Win7 x64 Installer
+    needs: build-patched-rust
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout Könfox build toolkit
+        uses: actions/checkout@v4
+
+      - name: Free runner disk space (~40+ GB)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Add 8 GB swapfile safety net for xul.dll linking
+        run: |
+          sudo fallocate -l 8G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+          df -h /
+
+      - name: Install Linux->Windows cross-compile packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git python3 python3-pip curl msitools cmake ninja-build \
+            zip xz-utils zstd build-essential pkg-config librsvg2-bin imagemagick
+
+      - name: Restore Win7-patched Rust toolchain from cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/rust-win7-cache
+          key: ${{ needs.build-patched-rust.outputs.cache_key }}
+
+      - name: Unpack Win7-patched Rust toolchain
+        run: |
+          mkdir -p /tmp/rust-win7-dist
+          tar --zstd -xf /tmp/rust-win7-cache/rust-win7-toolchain.tar.zst -C /tmp/rust-win7-dist
+          /tmp/rust-win7-dist/bin/rustc --version
+          /tmp/rust-win7-dist/bin/cargo --version
+
+      - name: Fetch, bootstrap, patch, build, package, and audit Könfox Nightly
+        env:
+          MOZBUILD_STATE_PATH: /tmp/mozbuild
+        run: |
+          chmod +x build.sh
+          ./build.sh \
+            --profile fast \
+            --low-disk \
+            --skip-rust \
+            --rust-version "${{ needs.build-patched-rust.outputs.rust_version }}" \
+            --rust-dist /tmp/rust-win7-dist \
+            --firefox-ref "${{ inputs.firefox_ref }}" \
+            --work-dir /tmp/konfox-work \
+            all
+
+      - name: Upload Könfox Nightly Windows 7 x64 Installer & Portable ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: konfox-nightly-win7-x64
+          path: |
+            out/*.installer.exe
+            out/*.zip
+            out/SHA256SUMS.txt
+            out/win7-pe-audit.txt
+          retention-days: 30
+
+      - name: Publish GitHub Release (optional)
+        if: inputs.create_release == true
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: konfox-nightly-${{ github.run_number }}
+          name: "Könfox Nightly (Win7 SP1 x64) — Build #${{ github.run_number }}"
+          prerelease: true
+          body: |
+            Automated Linux -> Windows 7 SP1 x64 cross-compile of **Könfox Nightly** (based on `mozilla-firefox/firefox@${{ inputs.firefox_ref }}`, built with Win7-patched Rust `${{ needs.build-patched-rust.outputs.rust_version }}`).
+
+            - Windows content sandbox: **Enabled**
+            - Bundled MSVC CRT + UCRT DLLs: **Included**
+            - Automated Win7 PE32+ import audit: see attached `win7-pe-audit.txt`
+          files: |
+            out/*.installer.exe
+            out/*.zip
+            out/SHA256SUMS.txt
+            out/win7-pe-audit.txt
