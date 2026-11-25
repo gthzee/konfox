@@ -1,0 +1,310 @@
+#!/usr/bin/env bash
+# =============================================================================
+# Könfox Nightly — Linux -> Windows 7 SP1 x64 Cross-Compilation Orchestrator
+# =============================================================================
+# Usage:
+#   ./build.sh [options] [stage]
+#
+# Options:
+#   --profile fast|release    Build profile (default: fast; release enables cross-LTO)
+#   --rust-version X.Y.Z      Override Rust version (default: auto-detected from Nightly)
+#   --rust-dist DIR           Use/install patched Rust toolchain at DIR
+#   --firefox-ref REF         Git ref/branch/commit in mozilla-firefox/firefox (default: main)
+#   --work-dir DIR            Working directory for checkouts & objdir (default: ./work)
+#   --skip-rust               Reuse already-built patched Rust in --rust-dist
+#   --low-disk                Prune downloaded .tar.zst toolchain archives to save disk space
+#
+# Stages (default: all):
+#   check | fetch | bootstrap | rust | patch | build | package | verify | all
+# =============================================================================
+
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROFILE="fast"
+RUST_VERSION=""
+RUST_DIST_DIR=""
+FIREFOX_REF="main"
+WORK_DIR="${ROOT_DIR}/work"
+OUT_DIR="${ROOT_DIR}/out"
+SKIP_RUST=0
+LOW_DISK=0
+STAGE="all"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --profile)      PROFILE="$2"; shift 2 ;;
+        --rust-version) RUST_VERSION="$2"; shift 2 ;;
+        --rust-dist)    RUST_DIST_DIR="$2"; shift 2 ;;
+        --firefox-ref)  FIREFOX_REF="$2"; shift 2 ;;
+        --work-dir)     WORK_DIR="$2"; shift 2 ;;
+        --skip-rust)    SKIP_RUST=1; shift ;;
+        --low-disk)     LOW_DISK=1; shift ;;
+        -h|--help)
+            sed -n '2,22p' "$0"
+            exit 0
+            ;;
+        *)
+            STAGE="$1"
+            shift
+            ;;
+    esac
+done
+
+FIREFOX_DIR="${WORK_DIR}/firefox"
+RUST_SRC_DIR="${WORK_DIR}/rust"
+[[ -n "$RUST_DIST_DIR" ]] || RUST_DIST_DIR="${WORK_DIR}/rust-win7-toolchain"
+MOZBUILD_DIR="${MOZBUILD_STATE_PATH:-${HOME}/.mozbuild}"
+export MOZBUILD_STATE_PATH="$MOZBUILD_DIR"
+
+if [[ "$PROFILE" == "release" ]]; then
+    MOZCONFIG_FILE="${ROOT_DIR}/mozconfigs/konfox-nightly-win64.mozconfig"
+    OBJDIR="${WORK_DIR}/obj-konfox-win64-release"
+else
+    MOZCONFIG_FILE="${ROOT_DIR}/mozconfigs/konfox-fast-win64.mozconfig"
+    OBJDIR="${WORK_DIR}/obj-konfox-win64-fast"
+fi
+
+log() { printf '\n\033[1;36m[konfox]\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[konfox:warn]\033[0m %s\n' "$*" >&2; }
+die() { printf '\033[1;31m[konfox:error]\033[0m %s\n' "$*" >&2; exit 1; }
+
+stage_check() {
+    log "Checking Linux host requirements..."
+    [[ "$(uname -s)" == "Linux" ]] || die "build.sh is designed for a Linux x86_64 cross-compile host."
+    [[ "$(uname -m)" == "x86_64" ]] || die "Expected x86_64 Linux host."
+
+    local missing=()
+    for cmd in git python3 curl msiextract cmake ninja zip tar xz; do
+        command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        die "Missing host tools: ${missing[*]}. On Debian/Ubuntu run:
+  sudo apt update && sudo apt install -y git python3 python3-pip curl msitools cmake ninja-build zip xz-utils build-essential pkg-config librsvg2-bin imagemagick"
+    fi
+
+    local ram_gb avail_gb
+    ram_gb=$(awk '/MemTotal/ {printf "%d", $2/1024/1024}' /proc/meminfo)
+    avail_gb=$(df -BG --output=avail "$ROOT_DIR" | tail -n1 | tr -dc '0-9')
+    log "Host detected: $(nproc) CPU cores, ${ram_gb} GiB RAM, ${avail_gb} GiB free disk"
+    if [[ "$ram_gb" -lt 14 ]]; then
+        warn "RAM is ${ram_gb} GiB (< 16 GiB). Linking xul.dll may OOM unless you add swap (e.g. 16–24 GiB swapfile)."
+    fi
+    if [[ "$avail_gb" -lt 50 ]]; then
+        warn "Free disk is ${avail_gb} GiB (< 50 GiB). Full Firefox Nightly + Rust cross-build typically needs 50–80 GiB."
+    fi
+}
+
+stage_fetch() {
+    mkdir -p "$WORK_DIR" "$OUT_DIR"
+    if [[ ! -d "$FIREFOX_DIR/.git" ]]; then
+        log "Cloning Mozilla Firefox Nightly (${FIREFOX_REF})..."
+        git clone --depth 1 --branch "$FIREFOX_REF" https://github.com/mozilla-firefox/firefox.git "$FIREFOX_DIR"
+    else
+        log "Updating existing Firefox checkout in ${FIREFOX_DIR}..."
+        git -C "$FIREFOX_DIR" fetch --depth 1 origin "$FIREFOX_REF"
+        git -C "$FIREFOX_DIR" checkout -f FETCH_HEAD
+    fi
+
+    if [[ -z "$RUST_VERSION" ]]; then
+        if [[ -f "$FIREFOX_DIR/docs/writing-rust-code/update-policy.md" ]]; then
+            RUST_VERSION=$(python3 - "$FIREFOX_DIR/docs/writing-rust-code/update-policy.md" <<'PY'
+import re, sys
+from pathlib import Path
+text = Path(sys.argv[1]).read_text(encoding="utf-8")
+versions = re.findall(r"\|\s*Firefox\s+\d+\s*\|\s*Rust\s+([0-9]+\.[0-9]+\.[0-9]+)", text)
+print(versions[-1] if versions else "1.100.0")
+PY
+            )
+        else
+            RUST_VERSION="1.100.0"
+        fi
+        log "Auto-detected Rust version: ${RUST_VERSION} (override with --rust-version)"
+    fi
+}
+
+stage_bootstrap() {
+    log "Bootstrapping Mozilla Linux->Windows cross-compile toolchains (clang-cl, lld-link, VS sysroot)..."
+    mkdir -p "$WORK_DIR" "$MOZBUILD_DIR"
+    pushd "$FIREFOX_DIR" >/dev/null
+    MOZCONFIG="$MOZCONFIG_FILE" ./mach --no-interactive bootstrap \
+        --application-choice=browser \
+        --no-system-changes || warn "mach bootstrap reported non-fatal warning; verifying sysroot during configure..."
+    popd >/dev/null
+
+    if [[ "$LOW_DISK" -eq 1 ]]; then
+        log "Pruning cached .tar.zst archives in ${MOZBUILD_DIR}/toolchains to save disk space..."
+        rm -rf "${MOZBUILD_DIR}/toolchains" "${MOZBUILD_DIR}/clang-tools"
+    fi
+}
+
+stage_rust() {
+    if [[ "$SKIP_RUST" -eq 1 && -x "${RUST_DIST_DIR}/bin/rustc" ]]; then
+        log "Reusing existing patched Rust toolchain at ${RUST_DIST_DIR}"
+        return 0
+    fi
+
+    [[ -n "$RUST_VERSION" ]] || RUST_VERSION="1.100.0"
+    log "Preparing patched Rust ${RUST_VERSION} (Linux host -> Win7-compatible x86_64-pc-windows-msvc target)..."
+
+    if [[ ! -d "$RUST_SRC_DIR/.git" ]]; then
+        git clone --depth 1 --branch "$RUST_VERSION" https://github.com/rust-lang/rust.git "$RUST_SRC_DIR"
+    else
+        git -C "$RUST_SRC_DIR" fetch --depth 1 origin tag "$RUST_VERSION"
+        git -C "$RUST_SRC_DIR" checkout -f "$RUST_VERSION"
+        git -C "$RUST_SRC_DIR" reset --hard HEAD
+    fi
+    git -C "$RUST_SRC_DIR" submodule update --init --recursive --depth 1
+
+    log "Applying version-agnostic Win7 stdlib patches to Rust ${RUST_VERSION}..."
+    python3 "${ROOT_DIR}/scripts/patch_rust_win7.py" "$RUST_SRC_DIR"
+
+    local clang_bin="${MOZBUILD_DIR}/clang/bin"
+    local cc_win="clang-cl"
+    local ar_win="llvm-lib"
+    local ld_win="lld-link"
+    if [[ -x "${clang_bin}/clang-cl" ]]; then
+        cc_win="${clang_bin}/clang-cl"
+        ar_win="${clang_bin}/llvm-lib"
+        ld_win="${clang_bin}/lld-link"
+    fi
+
+    cat > "${RUST_SRC_DIR}/bootstrap.toml" <<EOF
+profile = "compiler"
+change-id = "ignore"
+
+[llvm]
+download-ci-llvm = true
+
+[build]
+host = ["x86_64-unknown-linux-gnu"]
+target = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+docs = false
+extended = true
+tools = ["cargo"]
+
+[install]
+prefix = "${RUST_DIST_DIR}"
+sysconfdir = "etc"
+
+[target.x86_64-pc-windows-msvc]
+cc = "${cc_win}"
+cxx = "${cc_win}"
+ar = "${ar_win}"
+linker = "${ld_win}"
+EOF
+
+    local vs_dir="${MOZBUILD_DIR}/vs"
+    if [[ -d "$vs_dir" ]]; then
+        local vc_lib ucrt_lib um_lib
+        vc_lib=$(find "$vs_dir" -type d -path "*/VC/Tools/MSVC/*/lib/x64" | head -n1 || true)
+        ucrt_lib=$(find "$vs_dir" -type d -path "*/Windows Kits/10/Lib/*/ucrt/x64" | head -n1 || true)
+        um_lib=$(find "$vs_dir" -type d -path "*/Windows Kits/10/Lib/*/um/x64" | head -n1 || true)
+        if [[ -n "$vc_lib" && -n "$ucrt_lib" && -n "$um_lib" ]]; then
+            export RUSTFLAGS="-L native=${vc_lib} -L native=${ucrt_lib} -L native=${um_lib}"
+            log "Configured Windows SDK lib paths from ${vs_dir} for Rust target stdlib"
+        fi
+    fi
+
+    pushd "$RUST_SRC_DIR" >/dev/null
+    log "Building patched rustc, cargo, and Win7-compatible x86_64-pc-windows-msvc stdlib..."
+    python3 x.py install compiler library cargo
+    popd >/dev/null
+
+    [[ -x "${RUST_DIST_DIR}/bin/rustc" ]] || die "Patched rustc was not installed to ${RUST_DIST_DIR}/bin/rustc"
+    log "Patched Rust ready: $("${RUST_DIST_DIR}/bin/rustc" --version)"
+
+    if [[ "$LOW_DISK" -eq 1 ]]; then
+        log "Cleaning Rust source/build directory (${RUST_SRC_DIR}) to reclaim disk space..."
+        rm -rf "$RUST_SRC_DIR"
+    fi
+}
+
+stage_patch() {
+    log "Installing Könfox Nightly branding..."
+    python3 "${ROOT_DIR}/scripts/apply_branding.py" "$FIREFOX_DIR"
+
+    log "Applying Könfox Windows 7 SP1 x64 patches..."
+    python3 "${ROOT_DIR}/scripts/apply_win7_patches.py" "$FIREFOX_DIR"
+}
+
+export_build_env() {
+    export MOZCONFIG="$MOZCONFIG_FILE"
+    if [[ -x "${RUST_DIST_DIR}/bin/rustc" ]]; then
+        export KONFOX_RUSTC="${RUST_DIST_DIR}/bin/rustc"
+        export KONFOX_CARGO="${RUST_DIST_DIR}/bin/cargo"
+        export PATH="${RUST_DIST_DIR}/bin:${PATH}"
+    fi
+
+    local vs_dir="${MOZBUILD_DIR}/vs"
+    if [[ -d "$vs_dir" ]]; then
+        KONFOX_VC_REDIST_DIR=$(find "$vs_dir" -type d -path "*/VC/Redist/MSVC/*/x64/Microsoft.VC*.CRT" | head -n1 || true)
+        KONFOX_UCRT_REDIST_DIR=$(find "$vs_dir" -type d -path "*/Windows Kits/10/Redist/*/ucrt/DLLs/x64" | head -n1 || true)
+        export KONFOX_VC_REDIST_DIR KONFOX_UCRT_REDIST_DIR
+        [[ -n "$KONFOX_VC_REDIST_DIR" ]] && log "Bundling MSVC CRT from: ${KONFOX_VC_REDIST_DIR}"
+        [[ -n "$KONFOX_UCRT_REDIST_DIR" ]] && log "Bundling UCRT DLLs from: ${KONFOX_UCRT_REDIST_DIR}"
+    fi
+}
+
+stage_build() {
+    export_build_env
+    log "Cross-compiling Könfox Nightly (${PROFILE}) for Windows 7 SP1 x64..."
+    pushd "$FIREFOX_DIR" >/dev/null
+    # Ensure VS sysroot is downloaded first so CRT/UCRT redist dirs exist before configure
+    if [[ ! -d "${MOZBUILD_DIR}/vs" ]]; then
+        ./mach configure || true
+        export_build_env
+    fi
+    ./mach build
+    popd >/dev/null
+}
+
+stage_package() {
+    export_build_env
+    log "Packaging Könfox Nightly (.zip + Windows .installer.exe)..."
+    pushd "$FIREFOX_DIR" >/dev/null
+    ./mach package
+    ./mach build installers-en-US
+    popd >/dev/null
+
+    mkdir -p "$OUT_DIR"
+    find "${OBJDIR}/dist" -maxdepth 3 \( -name "*.zip" -o -name "*.installer.exe" \) -exec cp -v {} "$OUT_DIR/" \;
+    (cd "$OUT_DIR" && sha256sum *.zip *.exe 2>/dev/null > SHA256SUMS.txt || true)
+    log "Packaged artifacts copied to: ${OUT_DIR}"
+    ls -lh "$OUT_DIR"
+}
+
+stage_verify() {
+    local dist_bin="${OBJDIR}/dist/konfox"
+    [[ -d "$dist_bin" ]] || dist_bin="${OBJDIR}/dist/firefox"
+    [[ -d "$dist_bin" ]] || die "Could not locate built distribution folder under ${OBJDIR}/dist"
+
+    mkdir -p "$OUT_DIR"
+    log "Auditing every built .exe and .dll for Windows 7 SP1 x64 import compatibility..."
+    python3 "${ROOT_DIR}/scripts/verify_win7_pe.py" "$dist_bin" | tee "${OUT_DIR}/win7-pe-audit.txt"
+}
+
+case "$STAGE" in
+    check)     stage_check ;;
+    fetch)     stage_fetch ;;
+    bootstrap) stage_bootstrap ;;
+    rust)      stage_rust ;;
+    patch)     stage_patch ;;
+    build)     stage_build ;;
+    package)   stage_package ;;
+    verify)    stage_verify ;;
+    all)
+        stage_check
+        stage_fetch
+        stage_bootstrap
+        stage_rust
+        stage_patch
+        stage_build
+        stage_package
+        stage_verify
+        log "ALL DONE! Copy files from ${OUT_DIR} to your Windows 7 SP1 x64 machine to test."
+        ;;
+    *)
+        die "Unknown stage: ${STAGE}"
+        ;;
+esac

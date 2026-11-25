@@ -1,0 +1,55 @@
+# =============================================================================
+# Könfox Nightly — Release-Optimized Linux -> Windows 7 SP1 x64 Cross-Compile
+# =============================================================================
+# Target:   x86_64-pc-windows-msvc (Windows 7 SP1 x64 & Windows 8/8.1/10/11)
+# Host:     Linux x86_64 (clang-cl + lld-link + Mozilla Taskcluster VS sysroot)
+# Sandbox:  ENABLED
+#
+# Adds cross-language LTO (C++ + Rust) for maximum runtime performance.
+# (Requires >= 32 GB RAM on the Linux build host.)
+# =============================================================================
+
+ac_add_options --enable-application=browser
+ac_add_options --target=x86_64-pc-windows-msvc
+ac_add_options --enable-bootstrap
+
+# Build as Nightly with our custom Könfox branding
+ac_add_options --with-branding=browser/branding/konfox
+ac_add_options --enable-update-channel=nightly
+ac_add_options --with-app-name=konfox
+ac_add_options --with-app-basename=Konfox
+
+# Production optimizations (cross-language LTO)
+ac_add_options --enable-optimize
+ac_add_options --disable-debug
+ac_add_options --disable-tests
+ac_add_options --disable-crashreporter
+ac_add_options --disable-updater
+ac_add_options --disable-maintenance-service
+ac_add_options --disable-default-browser-agent
+export MOZ_LTO=cross
+ac_add_options --enable-rust-simd
+ac_add_options --enable-js-shell
+
+# Add-on flexibility
+ac_add_options --allow-addon-sideload
+ac_add_options --with-unsigned-addon-scopes=app,system
+
+# Bundle MSVC CRT & UCRT DLLs directly so clean Windows 7 SP1 machines launch
+# without needing separate VC++ Redistributable / KB2999226 installs.
+if [ -n "$KONFOX_VC_REDIST_DIR" ]; then
+    ac_add_options --with-redist="$KONFOX_VC_REDIST_DIR"
+fi
+if [ -n "$KONFOX_UCRT_REDIST_DIR" ]; then
+    export WIN_UCRT_REDIST_DIR="$KONFOX_UCRT_REDIST_DIR"
+fi
+
+# Point Cargo & rustc strictly at our patched Win7-emitting Rust toolchain
+if [ -n "$KONFOX_RUSTC" ]; then
+    export RUSTC="$KONFOX_RUSTC"
+fi
+if [ -n "$KONFOX_CARGO" ]; then
+    export CARGO="$KONFOX_CARGO"
+fi
+
+mk_add_options MOZ_OBJDIR=@TOPSRCDIR@/../obj-konfox-win64-release

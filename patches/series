@@ -1,0 +1,12 @@
+# Könfox Nightly — Optional Extra Git Patch Series (Windows 7 SP1 x64)
+#
+# Built-in structural patches (NSIS Win7 gate, WindowsVersion.h helpers,
+# WebSerial CfgMgr32 dynamic loading) are handled automatically by
+# `scripts/apply_win7_patches.py`.
+#
+# Add extra `.patch` or `.diff` filenames below (one per line, applied in order)
+# whenever `scripts/verify_win7_pe.py` or Windows 7 testing reveals a new
+# Nightly regression.
+#
+# Example:
+# 0001-fix-new-win10-api.patch
