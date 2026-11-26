@@ -80,7 +80,12 @@ stage_check() {
     done
     if [[ ${#missing[@]} -gt 0 ]]; then
         die "Missing host tools: ${missing[*]}. On Debian/Ubuntu run:
-  sudo apt update && sudo apt install -y git python3 python3-pip curl msitools cmake ninja-build nsis p7zip-full zip xz-utils zstd build-essential pkg-config librsvg2-bin imagemagick"
+  sudo apt update && sudo apt install -y git python3 python3-pip curl msitools cmake ninja-build nsis p7zip-full zip xz-utils zstd build-essential pkg-config librsvg2-bin imagemagick libc6-i386 lib32gcc-s1 lib32stdc++6 lib32atomic1 lib32z1"
+    fi
+
+    if [[ ! -e /lib/ld-linux.so.2 ]]; then
+        die "Missing 32-bit loader /lib/ld-linux.so.2 (required by Mozilla's bootstrapped Wine for midl.exe).
+  On Debian/Ubuntu run: sudo apt install -y libc6-i386 lib32gcc-s1 lib32stdc++6 lib32atomic1 lib32z1"
     fi
 
     local ram_gb avail_gb
@@ -322,6 +327,7 @@ stage_package() {
 stage_verify() {
     local dist_bin="${OBJDIR}/dist/konfox"
     [[ -d "$dist_bin" ]] || dist_bin="${OBJDIR}/dist/firefox"
+    [[ -d "$dist_bin" ]] || dist_bin="${OBJDIR}/dist/bin"
     [[ -d "$dist_bin" ]] || die "Could not locate built distribution folder under ${OBJDIR}/dist"
 
     mkdir -p "$OUT_DIR"

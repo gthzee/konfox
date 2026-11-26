@@ -297,9 +297,18 @@ def main() -> int:
         print(f"[verify-win7] No .exe or .dll files found under {args.target}", file=sys.stderr)
         return 2
 
+    # Optional Win10/11-only Microsoft Windows App SDK DLLs bundled by Firefox 163+
+    # (never loaded on Windows 7; skip so they don't produce false positives)
+    OPTIONAL_WIN10_BUNDLED_PREFIXES = ("microsoft.",)
+    OPTIONAL_WIN10_BUNDLED_EXACT = {"coremessagingxp.dll", "marshal.dll"}
+
     all_findings: list[str] = []
     scanned = 0
     for pe in pe_files:
+        name_lower = pe.name.lower()
+        if name_lower in OPTIONAL_WIN10_BUNDLED_EXACT or name_lower.startswith(OPTIONAL_WIN10_BUNDLED_PREFIXES):
+            print(f"[verify-win7] skipping optional Win10+ AppSDK DLL: {pe.name}")
+            continue
         try:
             findings = audit_pe_file(pe, include_delayload=args.include_delayload)
         except ValueError as exc:
