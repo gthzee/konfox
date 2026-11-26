@@ -29,6 +29,7 @@ FORBIDDEN_DLLS_WIN7: dict[str, str] = {
     "api-ms-win-core-winrt-error-l1-1-0.dll": "Win8+ WinRT error",
     "api-ms-win-shcore-scaling-l1-1-1.dll": "Win8.1+ per-monitor DPI scaling",
     "bcryptprimitives.dll": "ProcessPrng export is Win10+ only",
+    "combase.dll": "Win8+ COM/WinRT base (use ole32.dll + dynamic RoGetAgileReference on Win7)",
     "dcomp.dll": "Win8+ DirectComposition (must be delay-loaded/dynamic)",
     "d3d12.dll": "Win10+ Direct3D 12 (must be delay-loaded/dynamic)",
     "shcore.dll": "Win8.1+ Shell Core (must be delay-loaded/dynamic)",
@@ -106,6 +107,7 @@ FORBIDDEN_APIS_WIN7: dict[str, dict[str, str]] = {
         "GetCurrentPackageFullName": "Win8+ AppModel (must be GetProcAddress)",
         "GetCurrentPackageFamilyName": "Win8+ AppModel (must be GetProcAddress)",
         "GetCurrentPackageId": "Win8+ AppModel (must be GetProcAddress)",
+        "GetCurrentApplicationUserModelId": "Win8+ AppModel (must be GetProcAddress)",
         "GetPackageFullName": "Win8+ AppModel (must be GetProcAddress)",
         "AppPolicyGetProcessTerminationMethod": "Win10+ (must be GetProcAddress)",
         "CreatePseudoConsole": "Win10 1809+ (must be GetProcAddress)",
@@ -152,7 +154,31 @@ FORBIDDEN_APIS_WIN7: dict[str, dict[str, str]] = {
     "dxgi.dll": {
         "CreateDXGIFactory2": "Win8.1+ (must be GetProcAddress)",
     },
+    "ntdll.dll": {
+        "RtlAddGrowableFunctionTable": "Win8+ (use RtlInstallFunctionTableCallback fallback on Win7)",
+        "RtlDeleteGrowableFunctionTable": "Win8+ (must be GetProcAddress)",
+        "RtlWaitOnAddress": "Win8+ (must be GetProcAddress)",
+        "RtlWakeAddressSingle": "Win8+ (must be GetProcAddress)",
+        "RtlWakeAddressAll": "Win8+ (must be GetProcAddress)",
+    },
+    "winhttp.dll": {
+        "WinHttpWebSocketClose": "Win8+ WebSocket API",
+        "WinHttpWebSocketCompleteUpgrade": "Win8+ WebSocket API",
+        "WinHttpWebSocketQueryCloseStatus": "Win8+ WebSocket API",
+        "WinHttpWebSocketReceive": "Win8+ WebSocket API",
+        "WinHttpWebSocketSend": "Win8+ WebSocket API",
+        "WinHttpWebSocketShutdown": "Win8+ WebSocket API",
+    },
+    "userenv.dll": {
+        "DeriveAppContainerSidFromAppContainerName": "Win8+ AppContainer API (must be GetProcAddress)",
+        "CreateAppContainerProfile": "Win8+ AppContainer API",
+        "DeleteAppContainerProfile": "Win8+ AppContainer API",
+        "GetAppContainerFolderPath": "Win8+ AppContainer API",
+        "GetAppContainerRegistryLocation": "Win8+ AppContainer API",
+    },
 }
+
+WIN7_SUPPORTED_OS_GUID = b"{35138b9a-5d96-4fbd-8e2d-a2440225f93a}"
 
 
 @dataclass
@@ -312,6 +338,23 @@ def audit_pe_file(pe_path: Path, include_delayload: bool = False) -> list[str]:
     check_table(static_imports, "STATIC")
     if include_delayload:
         check_table(delay_imports, "DELAY")
+
+    # Main browser launcher executable MUST embed a Win32 RT_MANIFEST declaring
+    # Windows 7 compatibility ({35138b9a-5d96-4fbd-8e2d-a2440225f93a}) and the
+    # mozglue dependentAssembly; otherwise Windows 7 runs it in Vista compat mode.
+    if pe_path.name.lower() in ("konfox.exe", "firefox.exe"):
+        raw = pe_path.read_bytes()
+        if b"<assembly" not in raw or WIN7_SUPPORTED_OS_GUID not in raw.lower():
+            findings.append(
+                f"[MANIFEST] {pe_path.name}: missing embedded RT_MANIFEST with Windows 7 "
+                f"supportedOS GUID {WIN7_SUPPORTED_OS_GUID.decode('ascii')} "
+                f"(ensure browser/app/{pe_path.name}.manifest exists before building)"
+            )
+        elif b"mozglue" not in raw:
+            findings.append(
+                f"[MANIFEST] {pe_path.name}: embedded RT_MANIFEST missing mozglue dependentAssembly"
+            )
+
     return findings
 
 

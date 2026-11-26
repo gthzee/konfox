@@ -29,6 +29,9 @@ ac_add_options --disable-maintenance-service
 ac_add_options --disable-default-browser-agent
 # Skip prebuilt Win10-only onnxruntime.dll (Firefox falls back to WASM on Win7)
 ac_add_options --without-onnx-runtime
+# Disable Win8+/10+ push-notification helper (WinHttpWebSocket*) and Toast COM server
+ac_add_options --disable-push-notification-helper
+ac_add_options --disable-notification-server
 export MOZ_LTO=cross
 ac_add_options --enable-js-shell
 

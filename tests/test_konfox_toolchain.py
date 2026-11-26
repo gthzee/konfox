@@ -553,6 +553,197 @@ class KonfoxToolchainTests(unittest.TestCase):
             self.assertIn("VC/Tools/MSVC/14.44.35207/include", root_names)
             self.assertIn("Windows Kits/10/Include/10.0.28000.0/um", root_names)
 
+    def test_release10_win7_runtime_patches_and_idempotency(self) -> None:
+        import hashlib
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ff = Path(tmp) / "firefox"
+            ff.mkdir(parents=True)
+            (ff / "mach").write_text("#!/bin/sh\n", encoding="utf-8")
+
+            # Seed minimal snippets for Steps 16-24
+            files = {
+                "browser/app/firefox.exe.manifest": (
+                    '<?xml version="1.0" encoding="UTF-8"?>\n'
+                    '<assembly><assemblyIdentity name="Firefox"/>'
+                    "<description>Firefox</description>"
+                    '<dependentAssembly><assemblyIdentity name="mozglue"/></dependentAssembly>'
+                    '<application><supportedOS Id="{35138b9a-5d96-4fbd-8e2d-a2440225f93a}"/></application>'
+                    "</assembly>\n"
+                ),
+                "third_party/rust/windows-core/src/imp/bindings.rs": (
+                    'windows_link::link!("combase.dll" "system" fn CoIncrementMTAUsage(pcookie : *mut CO_MTA_USAGE_COOKIE) -> HRESULT);\n'
+                    'windows_link::link!("combase.dll" "system" fn CoTaskMemAlloc(cb : usize) -> *mut core::ffi::c_void);\n'
+                    'windows_link::link!("combase.dll" "system" fn CoTaskMemFree(pv : *const core::ffi::c_void));\n'
+                ),
+                "third_party/rust/windows-core/src/imp/marshaler.rs": (
+                    'windows_link::link!("combase.dll" "system" fn CoCreateFreeThreadedMarshaler(punkouter: *mut c_void, ppunkmarshal: *mut *mut c_void) -> HRESULT);\n'
+                ),
+                "third_party/rust/windows-sys/src/Windows/Win32/System/Com/mod.rs": (
+                    'windows_link::link!("combase.dll" "system" fn CoTaskMemAlloc(cb : usize) -> *mut core::ffi::c_void);\n'
+                ),
+                "ipc/mscom/AgileReference.cpp": (
+                    '#include "mozilla/mscom/AgileReference.h"\n'
+                    '#include "mozilla/Assertions.h"\n'
+                    "HRESULT AgileReference_CreateImpl(RefPtr<IAgileReference>& aRefPtr, REFIID riid,\n"
+                    "                                  IUnknown* aObject) {\n"
+                    "  MOZ_ASSERT(aObject);\n"
+                    "  MOZ_ASSERT(IsCOMInitializedOnCurrentThread());\n"
+                    "  return ::RoGetAgileReference(AGILEREFERENCE_DEFAULT, riid, aObject,\n"
+                    "                               getter_AddRefs(aRefPtr));\n"
+                    "}\n"
+                ),
+                "js/src/jit/ProcessExecutableMemory.cpp": (
+                    'extern "C" NTSYSAPI DWORD NTAPI RtlAddGrowableFunctionTable(\n'
+                    "    PVOID* DynamicTable, PRUNTIME_FUNCTION FunctionTable, DWORD EntryCount,\n"
+                    "    DWORD MaximumEntryCount, ULONG_PTR RangeBase, ULONG_PTR RangeEnd);\n"
+                    "    DWORD result = RtlAddGrowableFunctionTable(\n"
+                    "        &r->dynamicTable, &r->runtimeFunction, 1, 1, (ULONG_PTR)p,\n"
+                    "        (ULONG_PTR)p + bytes - pageSize);\n"
+                    "    if (result != S_OK) {\n"
+                    "      return false;\n"
+                    "    }\n"
+                ),
+                "widget/windows/ToastNotification.cpp": (
+                    '#include "ToastNotification.h"\n'
+                    "nsresult ToastNotification::Init() {\n"
+                    "  return NS_OK;\n"
+                    "}\n"
+                    "bool ToastNotification::AssignIfMsixAumid(Maybe<nsAutoString>& aAumid) {\n"
+                    "  UINT32 len = 0;\n"
+                    "  // ERROR_INSUFFICIENT_BUFFER signals that we're in an MSIX package, and\n"
+                    "  // therefore should use the package's AUMID.\n"
+                    "  if (GetCurrentApplicationUserModelId(&len, nullptr) !=\n"
+                    "      ERROR_INSUFFICIENT_BUFFER) {\n"
+                    '    MOZ_LOG(sWASLog, LogLevel::Debug, ("Not an MSIX package"));\n'
+                    "    return false;\n"
+                    "  }\n"
+                    "  mozilla::Buffer<wchar_t> buffer(len);\n"
+                    "  LONG success = GetCurrentApplicationUserModelId(&len, buffer.Elements());\n"
+                    "  return success == ERROR_SUCCESS;\n"
+                    "}\n"
+                ),
+                "widget/windows/nsWindow.cpp": (
+                    "  if (!sWinCloakEventHook) {}\n"
+                    "        (void)NS_WARN_IF(\n"
+                    "            GetCurrentApplicationUserModelId(&maxLength, aumid.get()));\n"
+                ),
+                "mfbt/RandomNum.cpp": (
+                    "  static const mozilla::StaticDynamicallyLinkedFunctionPtr<BOOL(WINAPI*)(\n"
+                    "      PBYTE, SIZE_T)>\n"
+                    '      pProcessPrng(L"bcryptprimitives.dll", "ProcessPrng");\n'
+                    "  return pProcessPrng && !!pProcessPrng(static_cast<PBYTE>(aBuffer), aLength);\n"
+                ),
+                "security/sandbox/chromium/base/rand_util_win.cc": (
+                    "decltype(&ProcessPrng) GetProcessPrng() {\n"
+                    '  HMODULE hmod = LoadLibraryW(L"bcryptprimitives.dll");\n'
+                    "  CHECK(hmod);\n"
+                    "  decltype(&ProcessPrng) process_prng_fn =\n"
+                    "      reinterpret_cast<decltype(&ProcessPrng)>(\n"
+                    '          GetProcAddress(hmod, "ProcessPrng"));\n'
+                    "  CHECK(process_prng_fn);\n"
+                    "  return process_prng_fn;\n"
+                    "}\n"
+                ),
+                "gfx/config/gfxConfigManager.cpp": (
+                    '#ifdef XP_WIN\n#  include "mozilla/gfx/DeviceManagerDx.h"\n#endif\n'
+                    "  mFeatureWrDComp->EnableByDefault();\n"
+                ),
+                "gfx/thebes/DeviceManagerDx.cpp": (
+                    '#include "DeviceManagerDx.h"\n'
+                    "  mFeatureLevels.AppendElement(D3D_FEATURE_LEVEL_11_1);\n"
+                ),
+                "mozglue/misc/WindowsDpiInitialization.cpp": (
+                    "  } else {\n"
+                    "    DynamicallyLinkedFunctionPtr<SetProcessDpiAwarenessType> f;\n"
+                    "    return WindowsDpiInitializationResult::Success;\n"
+                    "  }\n"
+                    "}\n"
+                ),
+                "xpcom/base/AvailableMemoryTracker.cpp": (
+                    "#if defined(XP_WIN)\n#endif\n"
+                    "void nsJemallocFreeDirtyPagesRunnable::OptimizeSystemHeap() {\n"
+                    "}\n"
+                ),
+            }
+            for rel, content in files.items():
+                p = ff / rel
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(content, encoding="utf-8")
+
+            for crate, rels in (
+                ("third_party/rust/windows-core", ["src/imp/bindings.rs", "src/imp/marshaler.rs"]),
+                ("third_party/rust/windows-sys", ["src/Windows/Win32/System/Com/mod.rs"]),
+            ):
+                cdir = ff / crate
+                ck = {r: hashlib.sha256((cdir / r).read_bytes()).hexdigest() for r in rels}
+                (cdir / ".cargo-checksum.json").write_text(json.dumps({"files": ck}), encoding="utf-8")
+
+            # Pass 1: apply every new step
+            self.assertEqual(len(apply_win7_patches.patch_konfox_app_manifest(ff, False)), 1)
+            self.assertEqual(len(apply_win7_patches.patch_combase_and_agile_reference(ff, False)), 6)
+            self.assertEqual(len(apply_win7_patches.patch_jit_unwind_win7(ff, False)), 1)
+            self.assertEqual(len(apply_win7_patches.patch_aumid_dynamic_load(ff, False)), 2)
+            self.assertEqual(len(apply_win7_patches.patch_win7_prng_fallbacks(ff, False)), 2)
+            self.assertEqual(len(apply_win7_patches.patch_graphics_win7(ff, False)), 2)
+            self.assertEqual(len(apply_win7_patches.patch_winrt_and_widget_win7(ff, False)), 1)
+            self.assertEqual(len(apply_win7_patches.patch_memory_tracker_win7(ff, False)), 1)
+
+            # Verify outputs
+            self.assertIn('name="Konfox"', (ff / "browser/app/konfox.exe.manifest").read_text())
+            self.assertNotIn('link!("combase.dll"', (ff / "third_party/rust/windows-core/src/imp/bindings.rs").read_text())
+            self.assertIn("GitAgileReference", (ff / "ipc/mscom/AgileReference.cpp").read_text())
+            self.assertIn("RtlInstallFunctionTableCallback", (ff / "js/src/jit/ProcessExecutableMemory.cpp").read_text())
+            self.assertNotIn("GetCurrentApplicationUserModelId(", (ff / "widget/windows/ToastNotification.cpp").read_text())
+            self.assertIn("SystemFunction036", (ff / "mfbt/RandomNum.cpp").read_text())
+            self.assertIn("KonfoxWin7RtlGenRandom", (ff / "security/sandbox/chromium/base/rand_util_win.cc").read_text())
+            self.assertIn("FEATURE_FAILURE_WIN7_NO_DCOMP", (ff / "gfx/config/gfxConfigManager.cpp").read_text())
+            self.assertIn("SetProcessDPIAware", (ff / "mozglue/misc/WindowsDpiInitialization.cpp").read_text())
+
+            # Pass 2: all steps must be 100% idempotent
+            self.assertEqual(apply_win7_patches.patch_konfox_app_manifest(ff, False), [])
+            self.assertEqual(apply_win7_patches.patch_combase_and_agile_reference(ff, False), [])
+            self.assertEqual(apply_win7_patches.patch_jit_unwind_win7(ff, False), [])
+            self.assertEqual(apply_win7_patches.patch_aumid_dynamic_load(ff, False), [])
+            self.assertEqual(apply_win7_patches.patch_win7_prng_fallbacks(ff, False), [])
+            self.assertEqual(apply_win7_patches.patch_graphics_win7(ff, False), [])
+            self.assertEqual(apply_win7_patches.patch_winrt_and_widget_win7(ff, False), [])
+            self.assertEqual(apply_win7_patches.patch_memory_tracker_win7(ff, False), [])
+
+    def test_verify_win7_pe_catches_combase_aumid_jit_websocket_and_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tdir = Path(tmp)
+            # 1. Polluted xul.dll with combase.dll + AUMID + RtlAddGrowableFunctionTable
+            bad_xul = tdir / "xul.dll"
+            bad_xul.write_bytes(
+                build_synthetic_pe64([
+                    ("combase.dll", ["CoTaskMemAlloc", "RoGetAgileReference"]),
+                    ("kernel32.dll", ["GetCurrentApplicationUserModelId"]),
+                    ("ntdll.dll", ["RtlAddGrowableFunctionTable"]),
+                    ("winhttp.dll", ["WinHttpWebSocketSend"]),
+                ])
+            )
+            findings = verify_win7_pe.audit_pe_file(bad_xul)
+            joined = "\n".join(findings)
+            self.assertIn("combase.dll", joined)
+            self.assertIn("GetCurrentApplicationUserModelId", joined)
+            self.assertIn("RtlAddGrowableFunctionTable", joined)
+            self.assertIn("WinHttpWebSocketSend", joined)
+
+            # 2. konfox.exe missing RT_MANIFEST -> FAIL
+            no_manifest = tdir / "konfox.exe"
+            no_manifest.write_bytes(build_synthetic_pe64([("kernel32.dll", ["CreateFileW"])]))
+            m_findings = verify_win7_pe.audit_pe_file(no_manifest)
+            self.assertTrue(any("[MANIFEST]" in f for f in m_findings), m_findings)
+
+            # 3. konfox.exe WITH embedded Win7 RT_MANIFEST + mozglue -> PASS
+            manifest_xml = (
+                b'<assembly><dependentAssembly><assemblyIdentity name="mozglue"/>'
+                b'</dependentAssembly><supportedOS Id="{35138b9a-5d96-4fbd-8e2d-a2440225f93a}"/></assembly>'
+            )
+            no_manifest.write_bytes(build_synthetic_pe64([("kernel32.dll", ["CreateFileW"])]) + manifest_xml)
+            self.assertEqual(verify_win7_pe.audit_pe_file(no_manifest), [])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

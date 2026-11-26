@@ -1263,6 +1263,1400 @@ def apply_patch_series(firefox_dir: Path, patches_dir: Path, dry_run: bool) -> l
     return applied
 
 
+# ---------------------------------------------------------------------------
+# 16. browser/app/konfox.exe.manifest — Win32 RT_MANIFEST with Win7 GUID
+# ---------------------------------------------------------------------------
+def patch_konfox_app_manifest(firefox_dir: Path, dry_run: bool) -> list[str]:
+    """
+    config/rules.mk looks for $(srcdir)/$(notdir $1).manifest when linking an
+    executable. Because Könfox sets MOZ_APP_NAME=konfox, the build looks for
+    browser/app/konfox.exe.manifest instead of firefox.exe.manifest. Without it,
+    konfox.exe ships with NO embedded RT_MANIFEST and Windows 7 runs it in
+    Vista compatibility mode without Common-Controls v6 or mozglue assembly.
+    """
+    touched: list[str] = []
+    src_manifest = firefox_dir / "browser/app/firefox.exe.manifest"
+    dst_manifest = firefox_dir / "browser/app/konfox.exe.manifest"
+    if not src_manifest.is_file():
+        return touched
+
+    src_text = src_manifest.read_text(encoding="utf-8", errors="replace")
+    win7_guid = "{35138b9a-5d96-4fbd-8e2d-a2440225f93a}"
+    new_text = src_text.replace('name="Firefox"', 'name="Konfox"').replace(
+        "<description>Firefox</description>",
+        "<description>Konfox</description>",
+    )
+    if win7_guid not in new_text.lower():
+        new_text = new_text.replace(
+            "</application>",
+            f'      <supportedOS Id="{win7_guid}"/>\n    </application>',
+            1,
+        )
+
+    existing = dst_manifest.read_text(encoding="utf-8", errors="replace") if dst_manifest.is_file() else None
+    if existing != new_text:
+        if not dry_run:
+            dst_manifest.write_text(new_text, encoding="utf-8")
+        touched.append(str(dst_manifest.relative_to(firefox_dir)))
+    return touched
+
+
+# ---------------------------------------------------------------------------
+# 17. Eliminate static combase.dll imports (windows-core/sys + AgileReference)
+# ---------------------------------------------------------------------------
+def _refresh_cargo_checksum(crate_dir: Path, rel_paths: list[str], dry_run: bool) -> bool:
+    checksum_file = crate_dir / ".cargo-checksum.json"
+    if not checksum_file.is_file():
+        return False
+    data = json.loads(checksum_file.read_text(encoding="utf-8"))
+    files_map = data.get("files")
+    if not isinstance(files_map, dict):
+        return False
+    updated = False
+    for rel in rel_paths:
+        target = crate_dir / rel
+        if not target.is_file():
+            continue
+        digest = hashlib.sha256(target.read_bytes()).hexdigest()
+        if files_map.get(rel) != digest:
+            files_map[rel] = digest
+            updated = True
+    if updated and not dry_run:
+        checksum_file.write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
+    return updated
+
+
+def patch_combase_and_agile_reference(firefox_dir: Path, dry_run: bool) -> list[str]:
+    """
+    Windows 7 SP1 has no combase.dll (introduced in Windows 8).
+      1) Vendored Rust crates windows-core & windows-sys statically link
+         CoTaskMemAlloc, CoTaskMemFree, CoCreateFreeThreadedMarshaler, and
+         CoIncrementMTAUsage from combase.dll. The first three live in
+         ole32.dll since Windows 2000; CoIncrementMTAUsage is Win8+ and is
+         loaded dynamically with E_NOTIMPL fallback on Win7.
+      2) ipc/mscom/AgileReference.cpp statically calls ::RoGetAgileReference
+         (combase.dll). Load it dynamically and fall back to an in-file
+         IGlobalInterfaceTable-backed IAgileReference (ole32.dll) on Win7.
+    """
+    touched: list[str] = []
+
+    # --- 17a. third_party/rust/windows-core ---
+    wc_dir = firefox_dir / "third_party/rust/windows-core"
+    wc_changed: list[str] = []
+
+    bindings_rs = wc_dir / "src/imp/bindings.rs"
+    if bindings_rs.is_file():
+        orig = bindings_rs.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        if "[Könfox Win7]" not in patched:
+            patched = patched.replace(
+                'windows_link::link!("combase.dll" "system" fn CoIncrementMTAUsage(pcookie : *mut CO_MTA_USAGE_COOKIE) -> HRESULT);',
+                (
+                    "// [Könfox Win7] Dynamically resolve CoIncrementMTAUsage from combase.dll\n"
+                    "// so xul.dll has zero static combase.dll imports on Windows 7 SP1.\n"
+                    "#[allow(non_snake_case)]\n"
+                    "pub unsafe fn CoIncrementMTAUsage(pcookie: *mut CO_MTA_USAGE_COOKIE) -> HRESULT {\n"
+                    "    unsafe {\n"
+                    "        let module = LoadLibraryExA(b\"combase.dll\\0\".as_ptr(), core::ptr::null_mut(), 0);\n"
+                    "        if module.is_null() {\n"
+                    "            return -2147467263i32; // E_NOTIMPL\n"
+                    "        }\n"
+                    "        if let Some(addr) = GetProcAddress(module, b\"CoIncrementMTAUsage\\0\".as_ptr()) {\n"
+                    "            let f: unsafe extern \"system\" fn(*mut CO_MTA_USAGE_COOKIE) -> HRESULT =\n"
+                    "                core::mem::transmute(addr);\n"
+                    "            return f(pcookie);\n"
+                    "        }\n"
+                    "        -2147467263i32 // E_NOTIMPL\n"
+                    "    }\n"
+                    "}"
+                ),
+            )
+            patched = patched.replace(
+                'windows_link::link!("combase.dll" "system" fn CoTaskMemAlloc(',
+                'windows_link::link!("ole32.dll" "system" fn CoTaskMemAlloc(',
+            )
+            patched = patched.replace(
+                'windows_link::link!("combase.dll" "system" fn CoTaskMemFree(',
+                'windows_link::link!("ole32.dll" "system" fn CoTaskMemFree(',
+            )
+        if patched != orig:
+            if not dry_run:
+                bindings_rs.write_text(patched, encoding="utf-8")
+            wc_changed.append("src/imp/bindings.rs")
+            touched.append(str(bindings_rs.relative_to(firefox_dir)))
+
+    marshaler_rs = wc_dir / "src/imp/marshaler.rs"
+    if marshaler_rs.is_file():
+        orig = marshaler_rs.read_text(encoding="utf-8", errors="replace")
+        patched = orig.replace(
+            'windows_link::link!("combase.dll" "system" fn CoCreateFreeThreadedMarshaler(',
+            'windows_link::link!("ole32.dll" "system" fn CoCreateFreeThreadedMarshaler(',
+        )
+        if patched != orig:
+            if not dry_run:
+                marshaler_rs.write_text(patched, encoding="utf-8")
+            wc_changed.append("src/imp/marshaler.rs")
+            touched.append(str(marshaler_rs.relative_to(firefox_dir)))
+
+    if wc_changed and _refresh_cargo_checksum(wc_dir, wc_changed, dry_run):
+        touched.append(str((wc_dir / ".cargo-checksum.json").relative_to(firefox_dir)))
+
+    # --- 17b. third_party/rust/windows-sys ---
+    ws_dir = firefox_dir / "third_party/rust/windows-sys"
+    com_mod_rs = ws_dir / "src/Windows/Win32/System/Com/mod.rs"
+    if com_mod_rs.is_file():
+        orig = com_mod_rs.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        for sym in ("CoCreateFreeThreadedMarshaler", "CoTaskMemAlloc", "CoTaskMemFree"):
+            patched = patched.replace(
+                f'windows_link::link!("combase.dll" "system" fn {sym}(',
+                f'windows_link::link!("ole32.dll" "system" fn {sym}(',
+            )
+        if patched != orig:
+            if not dry_run:
+                com_mod_rs.write_text(patched, encoding="utf-8")
+            touched.append(str(com_mod_rs.relative_to(firefox_dir)))
+            if _refresh_cargo_checksum(ws_dir, ["src/Windows/Win32/System/Com/mod.rs"], dry_run):
+                touched.append(str((ws_dir / ".cargo-checksum.json").relative_to(firefox_dir)))
+
+    # --- 17c. ipc/mscom/AgileReference.cpp ---
+    agile_cpp = firefox_dir / "ipc/mscom/AgileReference.cpp"
+    if agile_cpp.is_file():
+        orig = agile_cpp.read_text(encoding="utf-8", errors="replace")
+        if "[Könfox Win7]" not in orig and "::RoGetAgileReference(" in orig:
+            patched = orig
+            if '#include "mozilla/DynamicallyLinkedFunctionPtr.h"' not in patched:
+                patched = patched.replace(
+                    '#include "mozilla/Assertions.h"',
+                    (
+                        '#include <atomic>\n'
+                        '#include <objidl.h>\n'
+                        '#include "mozilla/Assertions.h"\n'
+                        '#include "mozilla/DynamicallyLinkedFunctionPtr.h"'
+                    ),
+                    1,
+                )
+            old_create = (
+                "HRESULT AgileReference_CreateImpl(RefPtr<IAgileReference>& aRefPtr, REFIID riid,\n"
+                "                                  IUnknown* aObject) {\n"
+                "  MOZ_ASSERT(aObject);\n"
+                "  MOZ_ASSERT(IsCOMInitializedOnCurrentThread());\n"
+                "  return ::RoGetAgileReference(AGILEREFERENCE_DEFAULT, riid, aObject,\n"
+                "                               getter_AddRefs(aRefPtr));\n"
+                "}"
+            )
+            new_create = """// [Könfox Win7] Fallback IAgileReference backed by COM's Global Interface Table
+// (CLSID_StdGlobalInterfaceTable in ole32.dll) when combase.dll!RoGetAgileReference
+// is unavailable on Windows 7 SP1.
+namespace {
+
+class GitAgileReference final : public IAgileReference {
+ public:
+  GitAgileReference(IGlobalInterfaceTable* aGit, DWORD aCookie)
+      : mRefCnt(0), mGit(aGit), mCookie(aCookie) {
+    if (mGit) {
+      mGit->AddRef();
+    }
+  }
+
+  ~GitAgileReference() {
+    if (mGit) {
+      if (mCookie) {
+        mGit->RevokeInterfaceFromGlobal(mCookie);
+      }
+      mGit->Release();
+    }
+  }
+
+  STDMETHODIMP QueryInterface(REFIID aIid, void** aOut) override {
+    if (!aOut) {
+      return E_POINTER;
+    }
+    if (aIid == IID_IUnknown || aIid == IID_IAgileReference) {
+      *aOut = static_cast<IAgileReference*>(this);
+      AddRef();
+      return S_OK;
+    }
+    *aOut = nullptr;
+    return E_NOINTERFACE;
+  }
+
+  STDMETHODIMP_(ULONG) AddRef() override {
+    return mRefCnt.fetch_add(1, std::memory_order_relaxed) + 1;
+  }
+
+  STDMETHODIMP_(ULONG) Release() override {
+    ULONG count = mRefCnt.fetch_sub(1, std::memory_order_acq_rel) - 1;
+    if (count == 0) {
+      delete this;
+    }
+    return count;
+  }
+
+  STDMETHODIMP Resolve(REFIID aIid, void** aOutInterface) override {
+    if (!aOutInterface) {
+      return E_POINTER;
+    }
+    *aOutInterface = nullptr;
+    if (!mGit || !mCookie) {
+      return E_UNEXPECTED;
+    }
+    return mGit->GetInterfaceFromGlobal(mCookie, aIid, aOutInterface);
+  }
+
+ private:
+  std::atomic<ULONG> mRefCnt;
+  IGlobalInterfaceTable* mGit;
+  DWORD mCookie;
+};
+
+}  // namespace
+
+HRESULT AgileReference_CreateImpl(RefPtr<IAgileReference>& aRefPtr, REFIID riid,
+                                  IUnknown* aObject) {
+  MOZ_ASSERT(aObject);
+  MOZ_ASSERT(IsCOMInitializedOnCurrentThread());
+
+  using RoGetAgileReferenceFn = HRESULT(WINAPI*)(
+      AgileReferenceOptions, REFIID, IUnknown*, IAgileReference**);
+  static const mozilla::StaticDynamicallyLinkedFunctionPtr<RoGetAgileReferenceFn>
+      pRoGetAgileReference(L"combase.dll", "RoGetAgileReference");
+  if (pRoGetAgileReference) {
+    return pRoGetAgileReference(AGILEREFERENCE_DEFAULT, riid, aObject,
+                                getter_AddRefs(aRefPtr));
+  }
+
+  RefPtr<IGlobalInterfaceTable> git;
+  HRESULT hr = ::CoCreateInstance(CLSID_StdGlobalInterfaceTable, nullptr,
+                                  CLSCTX_INPROC_SERVER, IID_IGlobalInterfaceTable,
+                                  getter_AddRefs(git));
+  if (FAILED(hr) || !git) {
+    return FAILED(hr) ? hr : E_FAIL;
+  }
+
+  DWORD cookie = 0;
+  hr = git->RegisterInterfaceInGlobal(aObject, riid, &cookie);
+  if (FAILED(hr)) {
+    return hr;
+  }
+
+  aRefPtr = new GitAgileReference(git.get(), cookie);
+  return S_OK;
+}"""
+            if old_create in patched:
+                patched = patched.replace(old_create, new_create, 1)
+                if not dry_run:
+                    agile_cpp.write_text(patched, encoding="utf-8")
+                touched.append(str(agile_cpp.relative_to(firefox_dir)))
+
+    return touched
+
+
+# ---------------------------------------------------------------------------
+# 18. SpiderMonkey JIT unwind: dynamic RtlAddGrowableFunctionTable + Win7 callback
+# ---------------------------------------------------------------------------
+def patch_jit_unwind_win7(firefox_dir: Path, dry_run: bool) -> list[str]:
+    """
+    js/src/jit/ProcessExecutableMemory.cpp statically imports Win8+
+    ntdll.dll!RtlAddGrowableFunctionTable. Resolve it dynamically via
+    GetProcAddress on ntdll.dll and fall back to Win7-native
+    RtlInstallFunctionTableCallback on Windows 7 SP1 x64.
+    """
+    touched: list[str] = []
+    pem_cpp = firefox_dir / "js/src/jit/ProcessExecutableMemory.cpp"
+    if not pem_cpp.is_file():
+        return touched
+
+    orig = pem_cpp.read_text(encoding="utf-8", errors="replace")
+    if "[Könfox Win7]" in orig or "RtlAddGrowableFunctionTable" not in orig:
+        return touched
+
+    patched = orig
+    old_decl = (
+        'extern "C" NTSYSAPI DWORD NTAPI RtlAddGrowableFunctionTable(\n'
+        "    PVOID* DynamicTable, PRUNTIME_FUNCTION FunctionTable, DWORD EntryCount,\n"
+        "    DWORD MaximumEntryCount, ULONG_PTR RangeBase, ULONG_PTR RangeEnd);"
+    )
+    new_decl = (
+        "// [Könfox Win7] Dynamically resolve Win8+ ntdll!RtlAddGrowableFunctionTable\n"
+        "// and fall back to RtlInstallFunctionTableCallback on Windows 7 SP1 x64.\n"
+        "using KonfoxRtlAddGrowableFunctionTableFn = DWORD(NTAPI*)(\n"
+        "    PVOID* DynamicTable, PRUNTIME_FUNCTION FunctionTable, DWORD EntryCount,\n"
+        "    DWORD MaximumEntryCount, ULONG_PTR RangeBase, ULONG_PTR RangeEnd);\n"
+        "static PRUNTIME_FUNCTION KonfoxWin7RuntimeFunctionCallback(DWORD64 /*ControlPc*/,\n"
+        "                                                           PVOID Context) {\n"
+        "  return reinterpret_cast<PRUNTIME_FUNCTION>(Context);\n"
+        "}"
+    )
+    old_call = (
+        "    DWORD result = RtlAddGrowableFunctionTable(\n"
+        "        &r->dynamicTable, &r->runtimeFunction, 1, 1, (ULONG_PTR)p,\n"
+        "        (ULONG_PTR)p + bytes - pageSize);\n"
+        "    if (result != S_OK) {\n"
+        "      return false;\n"
+        "    }"
+    )
+    new_call = (
+        '    HMODULE ntdll = ::GetModuleHandleW(L"ntdll.dll");\n'
+        "    auto addGrowable = ntdll\n"
+        "        ? reinterpret_cast<KonfoxRtlAddGrowableFunctionTableFn>(\n"
+        "              reinterpret_cast<void*>(\n"
+        '                  ::GetProcAddress(ntdll, "RtlAddGrowableFunctionTable")))\n'
+        "        : nullptr;\n"
+        "    if (addGrowable) {\n"
+        "      DWORD result = addGrowable(\n"
+        "          &r->dynamicTable, &r->runtimeFunction, 1, 1, (ULONG_PTR)p,\n"
+        "          (ULONG_PTR)p + bytes - pageSize);\n"
+        "      if (result != S_OK) {\n"
+        "        return false;\n"
+        "      }\n"
+        "    } else if (!::RtlInstallFunctionTableCallback(\n"
+        "                   reinterpret_cast<DWORD64>(p) | 0x3,\n"
+        "                   reinterpret_cast<DWORD64>(p),\n"
+        "                   static_cast<DWORD>(bytes),\n"
+        "                   &KonfoxWin7RuntimeFunctionCallback,\n"
+        "                   &r->runtimeFunction, nullptr)) {\n"
+        "      return false;\n"
+        "    }"
+    )
+    if old_decl in patched and old_call in patched:
+        patched = patched.replace(old_decl, new_decl, 1).replace(old_call, new_call, 1)
+        if not dry_run:
+            pem_cpp.write_text(patched, encoding="utf-8")
+        touched.append(str(pem_cpp.relative_to(firefox_dir)))
+    return touched
+
+
+# ---------------------------------------------------------------------------
+# 19. Dynamic kernel32!GetCurrentApplicationUserModelId + nsWindow/Toast guards
+# ---------------------------------------------------------------------------
+def patch_aumid_dynamic_load(firefox_dir: Path, dry_run: bool) -> list[str]:
+    """
+    kernel32.dll!GetCurrentApplicationUserModelId is Windows 8+ only and was
+    statically imported by xul.dll from ToastNotification.cpp and nsWindow.cpp.
+    Resolve it dynamically via GetProcAddress and guard Win10+ window/toast hooks.
+    """
+    touched: list[str] = []
+
+    # --- 19a. widget/windows/ToastNotification.cpp ---
+    toast_cpp = firefox_dir / "widget/windows/ToastNotification.cpp"
+    if toast_cpp.is_file():
+        orig = toast_cpp.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        if "[Könfox Win7]" not in patched:
+            if '#include "mozilla/WindowsVersion.h"' not in patched:
+                patched = patched.replace(
+                    '#include "ToastNotification.h"',
+                    '#include "ToastNotification.h"\n#include "mozilla/WindowsVersion.h"',
+                    1,
+                )
+            patched = patched.replace(
+                "nsresult ToastNotification::Init() {\n",
+                (
+                    "nsresult ToastNotification::Init() {\n"
+                    "  // [Könfox Win7] Windows Toast Notifications require Windows 10+.\n"
+                    "  if (!mozilla::IsWin10OrLater()) {\n"
+                    "    return NS_ERROR_NOT_IMPLEMENTED;\n"
+                    "  }\n"
+                ),
+                1,
+            )
+            old_msix = (
+                "bool ToastNotification::AssignIfMsixAumid(Maybe<nsAutoString>& aAumid) {\n"
+                "  UINT32 len = 0;\n"
+                "  // ERROR_INSUFFICIENT_BUFFER signals that we're in an MSIX package, and\n"
+                "  // therefore should use the package's AUMID.\n"
+                "  if (GetCurrentApplicationUserModelId(&len, nullptr) !=\n"
+                "      ERROR_INSUFFICIENT_BUFFER) {\n"
+                '    MOZ_LOG(sWASLog, LogLevel::Debug, ("Not an MSIX package"));\n'
+                "    return false;\n"
+                "  }\n"
+                "  mozilla::Buffer<wchar_t> buffer(len);\n"
+                "  LONG success = GetCurrentApplicationUserModelId(&len, buffer.Elements());"
+            )
+            new_msix = (
+                "bool ToastNotification::AssignIfMsixAumid(Maybe<nsAutoString>& aAumid) {\n"
+                "  using GetCurrentAumidFn = LONG(WINAPI*)(UINT32*, PWSTR);\n"
+                '  HMODULE k32 = ::GetModuleHandleW(L"kernel32.dll");\n'
+                "  auto getAumid = k32\n"
+                "      ? reinterpret_cast<GetCurrentAumidFn>(\n"
+                "            reinterpret_cast<void*>(\n"
+                '                ::GetProcAddress(k32, "GetCurrentApplicationUserModelId")))\n'
+                "      : nullptr;\n"
+                "  if (!getAumid) {\n"
+                "    return false;\n"
+                "  }\n"
+                "  UINT32 len = 0;\n"
+                "  // ERROR_INSUFFICIENT_BUFFER signals that we're in an MSIX package, and\n"
+                "  // therefore should use the package's AUMID.\n"
+                "  if (getAumid(&len, nullptr) != ERROR_INSUFFICIENT_BUFFER) {\n"
+                '    MOZ_LOG(sWASLog, LogLevel::Debug, ("Not an MSIX package"));\n'
+                "    return false;\n"
+                "  }\n"
+                "  mozilla::Buffer<wchar_t> buffer(len);\n"
+                "  LONG success = getAumid(&len, buffer.Elements());"
+            )
+            if old_msix in patched:
+                patched = patched.replace(old_msix, new_msix, 1)
+        if patched != orig:
+            if not dry_run:
+                toast_cpp.write_text(patched, encoding="utf-8")
+            touched.append(str(toast_cpp.relative_to(firefox_dir)))
+
+    # --- 19b. widget/windows/nsWindow.cpp ---
+    nswin_cpp = firefox_dir / "widget/windows/nsWindow.cpp"
+    if nswin_cpp.is_file():
+        orig = nswin_cpp.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        if "[Könfox Win7]" not in patched:
+            old_aumid = (
+                "        (void)NS_WARN_IF(\n"
+                "            GetCurrentApplicationUserModelId(&maxLength, aumid.get()));"
+            )
+            new_aumid = (
+                "        // [Könfox Win7] Dynamically load Win8+ GetCurrentApplicationUserModelId.\n"
+                "        using GetCurrentAumidFn = LONG(WINAPI*)(UINT32*, PWSTR);\n"
+                '        HMODULE k32 = ::GetModuleHandleW(L"kernel32.dll");\n'
+                "        auto getAumid = k32\n"
+                "            ? reinterpret_cast<GetCurrentAumidFn>(\n"
+                "                  reinterpret_cast<void*>(\n"
+                '                      ::GetProcAddress(k32, "GetCurrentApplicationUserModelId")))\n'
+                "            : nullptr;\n"
+                "        if (getAumid) {\n"
+                "          (void)NS_WARN_IF(getAumid(&maxLength, aumid.get()));\n"
+                "        }"
+            )
+            if old_aumid in patched:
+                patched = patched.replace(old_aumid, new_aumid, 1)
+            # Also guard Win10+ window cloaking hook (EVENT_OBJECT_CLOAKED is Win8+/10+)
+            patched = patched.replace(
+                "  if (!sWinCloakEventHook) {",
+                "  if (mozilla::IsWin10OrLater() && !sWinCloakEventHook) {",
+                1,
+            )
+        if patched != orig:
+            if not dry_run:
+                nswin_cpp.write_text(patched, encoding="utf-8")
+            touched.append(str(nswin_cpp.relative_to(firefox_dir)))
+
+    return touched
+
+
+# ---------------------------------------------------------------------------
+# 20. Win7 PRNG fallback (mfbt/RandomNum.cpp + Chromium rand_util_win.cc)
+# ---------------------------------------------------------------------------
+def patch_win7_prng_fallbacks(firefox_dir: Path, dry_run: bool) -> list[str]:
+    """
+    bcryptprimitives.dll!ProcessPrng was added in Windows 10. On Windows 7 SP1,
+    both mfbt/RandomNum.cpp (MOZ_RELEASE_ASSERT in RandomUint64OrDie) and
+    security/sandbox/chromium/base/rand_util_win.cc (CHECK(process_prng_fn))
+    crash immediately on startup unless they fall back to advapi32!SystemFunction036
+    (RtlGenRandom), which is natively available on Windows XP through Windows 11.
+    """
+    touched: list[str] = []
+
+    # --- 20a. mfbt/RandomNum.cpp ---
+    rand_cpp = firefox_dir / "mfbt/RandomNum.cpp"
+    if rand_cpp.is_file():
+        orig = rand_cpp.read_text(encoding="utf-8", errors="replace")
+        if "[Könfox Win7]" not in orig:
+            old_block = (
+                "  static const mozilla::StaticDynamicallyLinkedFunctionPtr<BOOL(WINAPI*)(\n"
+                "      PBYTE, SIZE_T)>\n"
+                '      pProcessPrng(L"bcryptprimitives.dll", "ProcessPrng");\n'
+                "  return pProcessPrng && !!pProcessPrng(static_cast<PBYTE>(aBuffer), aLength);"
+            )
+            new_block = (
+                "  static const mozilla::StaticDynamicallyLinkedFunctionPtr<BOOL(WINAPI*)(\n"
+                "      PBYTE, SIZE_T)>\n"
+                '      pProcessPrng(L"bcryptprimitives.dll", "ProcessPrng");\n'
+                "  if (pProcessPrng) {\n"
+                "    return !!pProcessPrng(static_cast<PBYTE>(aBuffer), aLength);\n"
+                "  }\n"
+                "  // [Könfox Win7] Fallback to advapi32!SystemFunction036 (RtlGenRandom)\n"
+                "  // when bcryptprimitives!ProcessPrng (Win10+) is unavailable.\n"
+                "  static const mozilla::StaticDynamicallyLinkedFunctionPtr<BOOLEAN(WINAPI*)(\n"
+                "      PVOID, ULONG)>\n"
+                '      pRtlGenRandom(L"advapi32.dll", "SystemFunction036");\n'
+                "  if (!pRtlGenRandom) {\n"
+                "    return false;\n"
+                "  }\n"
+                "  uint8_t* ptr = static_cast<uint8_t*>(aBuffer);\n"
+                "  size_t remaining = aLength;\n"
+                "  while (remaining > 0) {\n"
+                "    ULONG chunk = remaining > 0xFFFFFFFFUL\n"
+                "                      ? 0xFFFFFFFFUL\n"
+                "                      : static_cast<ULONG>(remaining);\n"
+                "    if (!pRtlGenRandom(ptr, chunk)) {\n"
+                "      return false;\n"
+                "    }\n"
+                "    ptr += chunk;\n"
+                "    remaining -= chunk;\n"
+                "  }\n"
+                "  return true;"
+            )
+            if old_block in orig:
+                patched = orig.replace(old_block, new_block, 1)
+                if not dry_run:
+                    rand_cpp.write_text(patched, encoding="utf-8")
+                touched.append(str(rand_cpp.relative_to(firefox_dir)))
+
+    # --- 20b. security/sandbox/chromium/base/rand_util_win.cc ---
+    rand_cc = firefox_dir / "security/sandbox/chromium/base/rand_util_win.cc"
+    if rand_cc.is_file():
+        orig = rand_cc.read_text(encoding="utf-8", errors="replace")
+        if "[Könfox Win7]" not in orig:
+            old_fn = (
+                "decltype(&ProcessPrng) GetProcessPrng() {\n"
+                '  HMODULE hmod = LoadLibraryW(L"bcryptprimitives.dll");\n'
+                "  CHECK(hmod);\n"
+                "  decltype(&ProcessPrng) process_prng_fn =\n"
+                "      reinterpret_cast<decltype(&ProcessPrng)>(\n"
+                '          GetProcAddress(hmod, "ProcessPrng"));\n'
+                "  CHECK(process_prng_fn);\n"
+                "  return process_prng_fn;\n"
+                "}"
+            )
+            new_fn = (
+                "// [Könfox Win7] Fallback to advapi32!SystemFunction036 (RtlGenRandom)\n"
+                "// when bcryptprimitives!ProcessPrng (Win10+) is unavailable.\n"
+                "BOOL WINAPI KonfoxWin7RtlGenRandom(PBYTE pbData, SIZE_T cbData) {\n"
+                "  static auto sRtlGenRandom = []() -> BOOLEAN(WINAPI*)(PVOID, ULONG) {\n"
+                '    HMODULE hAdvapi = LoadLibraryW(L"advapi32.dll");\n'
+                "    if (!hAdvapi) {\n"
+                "      return nullptr;\n"
+                "    }\n"
+                "    return reinterpret_cast<BOOLEAN(WINAPI*)(PVOID, ULONG)>(\n"
+                "        reinterpret_cast<void*>(\n"
+                '            GetProcAddress(hAdvapi, "SystemFunction036")));\n'
+                "  }();\n"
+                "  if (!sRtlGenRandom) {\n"
+                "    return FALSE;\n"
+                "  }\n"
+                "  while (cbData > 0) {\n"
+                "    ULONG chunk = cbData > std::numeric_limits<ULONG>::max()\n"
+                "                      ? std::numeric_limits<ULONG>::max()\n"
+                "                      : static_cast<ULONG>(cbData);\n"
+                "    if (!sRtlGenRandom(pbData, chunk)) {\n"
+                "      return FALSE;\n"
+                "    }\n"
+                "    pbData += chunk;\n"
+                "    cbData -= chunk;\n"
+                "  }\n"
+                "  return TRUE;\n"
+                "}\n\n"
+                "decltype(&ProcessPrng) GetProcessPrng() {\n"
+                '  HMODULE hmod = LoadLibraryW(L"bcryptprimitives.dll");\n'
+                "  if (hmod) {\n"
+                "    decltype(&ProcessPrng) process_prng_fn =\n"
+                "        reinterpret_cast<decltype(&ProcessPrng)>(\n"
+                "            reinterpret_cast<void*>(\n"
+                '                GetProcAddress(hmod, "ProcessPrng")));\n'
+                "    if (process_prng_fn) {\n"
+                "      return process_prng_fn;\n"
+                "    }\n"
+                "  }\n"
+                "  return &KonfoxWin7RtlGenRandom;\n"
+                "}"
+            )
+            if old_fn in orig:
+                patched = orig.replace(old_fn, new_fn, 1)
+                if not dry_run:
+                    rand_cc.write_text(patched, encoding="utf-8")
+                touched.append(str(rand_cc.relative_to(firefox_dir)))
+
+    return touched
+
+
+# ---------------------------------------------------------------------------
+# 21. Chromium Sandbox + Mozilla SandboxBroker Win7 SP1 runtime fixes
+# ---------------------------------------------------------------------------
+def patch_chromium_sandbox_runtime_win7(firefox_dir: Path, dry_run: bool) -> list[str]:
+    """
+    Fixes all post-load Windows 7 SP1 x64 runtime failures in Chromium sandbox
+    and Mozilla SandboxBroker:
+      - process_mitigations.cc: skip Win8+ mitigation policies on < WIN8
+      - broker_services.cc: skip PROC_THREAD_ATTRIBUTE_JOB_LIST (Win10+) and
+        assign the suspended child process to the job via AssignProcessToJobObject
+      - handle_closer_agent.cc: brute-force handle scan on < WIN8 because
+        ProcessHandleTable (58) requires Windows 8+
+      - sandbox_policy_base.cc: skip SetDisconnectCsrss (< WIN10) & SetFakeGdiInit (< WIN8)
+      - heap_helper.cc: skip FindCsrPortHeap on < WIN10
+      - window.cc: guard kAllApplicationPackages SID on >= WIN8
+      - app_container_base.cc: dynamically load userenv!DeriveAppContainerSidFromAppContainerName
+      - sandboxBroker.cpp: skip Win32k lockdown (< WIN8) and CIG (< WIN10)
+    """
+    touched: list[str] = []
+
+    # --- 21a. process_mitigations.cc ---
+    pm_cc = firefox_dir / "security/sandbox/chromium/sandbox/win/src/process_mitigations.cc"
+    if pm_cc.is_file():
+        orig = pm_cc.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        if "[Könfox Win7 mitigations]" not in patched:
+            dep_anchor = (
+                "    applied_flags |=\n"
+                "        combined_flags & (MITIGATION_DEP | MITIGATION_DEP_NO_ATL_THUNK);\n"
+                "  }\n"
+                "#endif"
+            )
+            if dep_anchor in patched:
+                patched = patched.replace(
+                    dep_anchor,
+                    dep_anchor
+                    + "\n\n  // [Könfox Win7 mitigations] Remaining mitigations require Windows 8+.\n"
+                    "  if (version < base::win::Version::WIN8) {\n"
+                    "    return true;\n"
+                    "  }",
+                    1,
+                )
+            sehop_anchor = (
+                "  if (flags & MITIGATION_SEHOP)\n"
+                "    *policy_value_1 |= PROCESS_CREATION_MITIGATION_POLICY_SEHOP_ENABLE;\n"
+                "#endif"
+            )
+            if sehop_anchor in patched:
+                patched = patched.replace(
+                    sehop_anchor,
+                    sehop_anchor
+                    + "\n\n  // [Könfox Win7 mitigations] Process creation mitigation policies require Windows 8+.\n"
+                    "  if (version < base::win::Version::WIN8) {\n"
+                    "    return;\n"
+                    "  }",
+                    1,
+                )
+        if patched != orig:
+            if not dry_run:
+                pm_cc.write_text(patched, encoding="utf-8")
+            touched.append(str(pm_cc.relative_to(firefox_dir)))
+
+    # --- 21b. broker_services.cc ---
+    bs_cc = firefox_dir / "security/sandbox/chromium/sandbox/win/src/broker_services.cc"
+    if bs_cc.is_file():
+        orig = bs_cc.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        if "[Könfox Win7]" not in patched:
+            old_job_attr = "  startup_info->AddJobToAssociate(policy_base->GetJobHandle());"
+            new_job_attr = (
+                "  // [Könfox Win7] PROC_THREAD_ATTRIBUTE_JOB_LIST requires Windows 10+.\n"
+                "  // On Windows 7/8, assign the suspended process in FinishSpawnTargetImpl.\n"
+                "  if (base::win::GetVersion() >= base::win::Version::WIN10) {\n"
+                "    startup_info->AddJobToAssociate(policy_base->GetJobHandle());\n"
+                "  }"
+            )
+            old_finish = (
+                "  ConfigBase* config_base = static_cast<ConfigBase*>(policy_base->GetConfig());\n\n"
+                "  if (config_base->GetJobLevel() <= JobLevel::kLimitedUser) {"
+            )
+            new_finish = (
+                "  ConfigBase* config_base = static_cast<ConfigBase*>(policy_base->GetConfig());\n\n"
+                "  if (base::win::GetVersion() < base::win::Version::WIN10) {\n"
+                "    HANDLE job_handle = policy_base->GetJobHandle();\n"
+                "    if (job_handle &&\n"
+                "        !::AssignProcessToJobObject(job_handle, process_info->process_handle())) {\n"
+                "      DWORD err = ::GetLastError();\n"
+                "      // On Win7, nested jobs are unsupported if the parent is already in a\n"
+                "      // non-breakaway job (ERROR_ACCESS_DENIED); allow launch to continue.\n"
+                "      if (err != ERROR_ACCESS_DENIED) {\n"
+                "        *last_error = err;\n"
+                "        target->Terminate();\n"
+                "        return SBOX_ERROR_CANNOT_INIT_JOB;\n"
+                "      }\n"
+                "    }\n"
+                "  }\n\n"
+                "  if (config_base->GetJobLevel() <= JobLevel::kLimitedUser) {"
+            )
+            if old_job_attr in patched and old_finish in patched:
+                patched = patched.replace(old_job_attr, new_job_attr, 1).replace(
+                    old_finish, new_finish, 1
+                )
+        if patched != orig:
+            if not dry_run:
+                bs_cc.write_text(patched, encoding="utf-8")
+            touched.append(str(bs_cc.relative_to(firefox_dir)))
+
+    # --- 21c. handle_closer_agent.cc ---
+    hc_cc = firefox_dir / "security/sandbox/chromium/sandbox/win/src/handle_closer_agent.cc"
+    if hc_cc.is_file():
+        orig = hc_cc.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        if "[Könfox Win7]" not in patched:
+            if '#include "base/win/windows_version.h"' not in patched:
+                patched = patched.replace(
+                    '#include "base/check.h"',
+                    '#include "base/check.h"\n#include "base/win/windows_version.h"',
+                    1,
+                )
+            old_scan = (
+                "  DWORD handle_count;\n"
+                "  if (!::GetProcessHandleCount(::GetCurrentProcess(), &handle_count)) {\n"
+                "    return false;\n"
+                "  }"
+            )
+            new_scan = (
+                "  DWORD handle_count;\n"
+                "  if (!::GetProcessHandleCount(::GetCurrentProcess(), &handle_count)) {\n"
+                "    return false;\n"
+                "  }\n\n"
+                "  // [Könfox Win7] ProcessHandleTable (58) requires Windows 8+.\n"
+                "  // Enumerate open handles step-by-4 on Windows 7 SP1.\n"
+                "  if (base::win::GetVersion() < base::win::Version::WIN8) {\n"
+                "    constexpr int kInvalidHandleThreshold = 100;\n"
+                "    constexpr uint32_t kHandleOffset = 4;\n"
+                "    uint32_t handle_value = 0;\n"
+                "    int invalid_count = 0;\n"
+                "    DWORD remaining = handle_count;\n"
+                "    while (remaining && invalid_count < kInvalidHandleThreshold) {\n"
+                "      handle_value += kHandleOffset;\n"
+                "      HANDLE handle = base::win::Uint32ToHandle(handle_value);\n"
+                "      auto type_name = GetTypeNameFromHandle(handle);\n"
+                "      if (!type_name) {\n"
+                "        ++invalid_count;\n"
+                "        continue;\n"
+                "      }\n"
+                "      --remaining;\n"
+                "      MaybeCloseHandle(type_name.value(), handle);\n"
+                "    }\n"
+                "    return true;\n"
+                "  }"
+            )
+            if old_scan in patched:
+                patched = patched.replace(old_scan, new_scan, 1)
+        if patched != orig:
+            if not dry_run:
+                hc_cc.write_text(patched, encoding="utf-8")
+            touched.append(str(hc_cc.relative_to(firefox_dir)))
+
+    # --- 21d. sandbox_policy_base.cc ---
+    spb_cc = firefox_dir / "security/sandbox/chromium/sandbox/win/src/sandbox_policy_base.cc"
+    if spb_cc.is_file():
+        orig = spb_cc.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        if "[Könfox Win7]" not in patched:
+            patched = patched.replace(
+                "ResultCode ConfigBase::SetDisconnectCsrss() {\n",
+                (
+                    "ResultCode ConfigBase::SetDisconnectCsrss() {\n"
+                    "  // [Könfox Win7] CSRSS disconnect requires Windows 10+.\n"
+                    "  if (base::win::GetVersion() < base::win::Version::WIN10) {\n"
+                    "    return SBOX_ALL_OK;\n"
+                    "  }\n"
+                ),
+                1,
+            )
+            patched = patched.replace(
+                "ResultCode ConfigBase::SetFakeGdiInit() {\n",
+                (
+                    "ResultCode ConfigBase::SetFakeGdiInit() {\n"
+                    "  // [Könfox Win7] Win32k lockdown fake GDI init requires Windows 8+.\n"
+                    "  if (base::win::GetVersion() < base::win::Version::WIN8) {\n"
+                    "    return SBOX_ALL_OK;\n"
+                    "  }\n"
+                ),
+                1,
+            )
+        if patched != orig:
+            if not dry_run:
+                spb_cc.write_text(patched, encoding="utf-8")
+            touched.append(str(spb_cc.relative_to(firefox_dir)))
+
+    # --- 21e. heap_helper.cc ---
+    hh_cc = firefox_dir / "security/sandbox/chromium/sandbox/win/src/heap_helper.cc"
+    if hh_cc.is_file():
+        orig = hh_cc.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        if "[Könfox Win7]" not in patched:
+            if '#include "base/win/windows_version.h"' not in patched:
+                patched = patched.replace(
+                    '#include "base/logging.h"',
+                    '#include "base/logging.h"\n#include "base/win/windows_version.h"',
+                    1,
+                )
+            patched = patched.replace(
+                "HANDLE FindCsrPortHeap() {\n",
+                (
+                    "HANDLE FindCsrPortHeap() {\n"
+                    "  // [Könfox Win7] CSRSS port heap inspection requires Windows 10+.\n"
+                    "  if (base::win::GetVersion() < base::win::Version::WIN10) {\n"
+                    "    return nullptr;\n"
+                    "  }\n"
+                ),
+                1,
+            )
+        if patched != orig:
+            if not dry_run:
+                hh_cc.write_text(patched, encoding="utf-8")
+            touched.append(str(hh_cc.relative_to(firefox_dir)))
+
+    # --- 21f. window.cc ---
+    win_cc = firefox_dir / "security/sandbox/chromium/sandbox/win/src/window.cc"
+    if win_cc.is_file():
+        orig = win_cc.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        if "[Könfox Win7]" not in patched:
+            if '#include "base/win/windows_version.h"' not in patched:
+                patched = patched.replace(
+                    '#include "base/win/security_descriptor.h"',
+                    '#include "base/win/security_descriptor.h"\n#include "base/win/windows_version.h"',
+                    1,
+                )
+            old_ace = (
+                "  if (!sd->SetDaclEntry(base::win::WellKnownSid::kAllApplicationPackages,\n"
+                "                        base::win::SecurityAccessMode::kGrant,\n"
+                "                        DESKTOP_GENERIC_READ | DESKTOP_GENERIC_WRITE |\n"
+                "                            DESKTOP_GENERIC_EXECUTE,\n"
+                "                        0)) {\n"
+                "    return false;\n"
+                "  }"
+            )
+            new_ace = (
+                "  // [Könfox Win7] ALL APPLICATION PACKAGES SID (S-1-15-2-1) is Windows 8+.\n"
+                "  if (base::win::GetVersion() >= base::win::Version::WIN8) {\n"
+                "    if (!sd->SetDaclEntry(base::win::WellKnownSid::kAllApplicationPackages,\n"
+                "                          base::win::SecurityAccessMode::kGrant,\n"
+                "                          DESKTOP_GENERIC_READ | DESKTOP_GENERIC_WRITE |\n"
+                "                              DESKTOP_GENERIC_EXECUTE,\n"
+                "                          0)) {\n"
+                "      return false;\n"
+                "    }\n"
+                "  }"
+            )
+            if old_ace in patched:
+                patched = patched.replace(old_ace, new_ace, 1)
+        if patched != orig:
+            if not dry_run:
+                win_cc.write_text(patched, encoding="utf-8")
+            touched.append(str(win_cc.relative_to(firefox_dir)))
+
+    # --- 21g. app_container_base.cc ---
+    ac_cc = firefox_dir / "security/sandbox/chromium/sandbox/win/src/app_container_base.cc"
+    if ac_cc.is_file():
+        orig = ac_cc.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        if "[Könfox Win7]" not in patched:
+            old_derive = (
+                "  HRESULT hr = ::DeriveAppContainerSidFromAppContainerName(package_name,\n"
+                "                                                           &package_sid_ptr);"
+            )
+            new_derive = (
+                "  // [Könfox Win7] Dynamically load Win8+ userenv!DeriveAppContainerSidFromAppContainerName.\n"
+                "  using DeriveSidFn = HRESULT(WINAPI*)(PCWSTR, PSID*);\n"
+                "  static auto sDeriveSid = []() -> DeriveSidFn {\n"
+                '    HMODULE hUserenv = ::LoadLibraryW(L"userenv.dll");\n'
+                "    if (!hUserenv) {\n"
+                "      return nullptr;\n"
+                "    }\n"
+                "    return reinterpret_cast<DeriveSidFn>(reinterpret_cast<void*>(\n"
+                '        ::GetProcAddress(hUserenv, "DeriveAppContainerSidFromAppContainerName")));\n'
+                "  }();\n"
+                "  if (!sDeriveSid) {\n"
+                "    return std::nullopt;\n"
+                "  }\n"
+                "  HRESULT hr = sDeriveSid(package_name, &package_sid_ptr);"
+            )
+            if old_derive in patched:
+                patched = patched.replace(old_derive, new_derive, 1)
+        if patched != orig:
+            if not dry_run:
+                ac_cc.write_text(patched, encoding="utf-8")
+            touched.append(str(ac_cc.relative_to(firefox_dir)))
+
+    # --- 21h. security/sandbox/win/src/sandboxbroker/sandboxBroker.cpp ---
+    sb_cpp = firefox_dir / "security/sandbox/win/src/sandboxbroker/sandboxBroker.cpp"
+    if sb_cpp.is_file():
+        orig = sb_cpp.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        if "[Könfox Win7]" not in patched:
+            patched = patched.replace(
+                "static sandbox::ResultCode AddWin32kLockdownConfig(\n"
+                "    sandbox::TargetConfig* aConfig) {\n",
+                (
+                    "static sandbox::ResultCode AddWin32kLockdownConfig(\n"
+                    "    sandbox::TargetConfig* aConfig) {\n"
+                    "  // [Könfox Win7] Win32k lockdown requires Windows 8+.\n"
+                    "  if (!mozilla::IsWin8OrLater()) {\n"
+                    "    return sandbox::SBOX_ALL_OK;\n"
+                    "  }\n"
+                ),
+                1,
+            )
+            patched = patched.replace(
+                "static sandbox::ResultCode AddCigToConfig(\n"
+                "    sandbox::TargetConfig* aConfig, bool aAlwaysProxyBinDirLoading = false) {\n",
+                (
+                    "static sandbox::ResultCode AddCigToConfig(\n"
+                    "    sandbox::TargetConfig* aConfig, bool aAlwaysProxyBinDirLoading = false) {\n"
+                    "  // [Könfox Win7] Code Integrity Guard requires Windows 10+.\n"
+                    "  if (!mozilla::IsWin10OrLater()) {\n"
+                    "    return sandbox::SBOX_ALL_OK;\n"
+                    "  }\n"
+                ),
+                1,
+            )
+        if patched != orig:
+            if not dry_run:
+                sb_cpp.write_text(patched, encoding="utf-8")
+            touched.append(str(sb_cpp.relative_to(firefox_dir)))
+
+    return touched
+
+
+# ---------------------------------------------------------------------------
+# 22. Graphics / WebRender Win7 SP1 fixes (DirectComposition & D3D 11.1)
+# ---------------------------------------------------------------------------
+def patch_graphics_win7(firefox_dir: Path, dry_run: bool) -> list[str]:
+    """
+    - gfx/config/gfxConfigManager.cpp: disable WebRender DirectComposition on
+      < Windows 10 (dcomp.dll does not exist on Windows 7 SP1).
+    - gfx/thebes/DeviceManagerDx.cpp: only request D3D_FEATURE_LEVEL_11_1 on
+      Windows 8+ (Win7 SP1 without Platform Update rejects 11_1).
+    """
+    touched: list[str] = []
+
+    gcm_cpp = firefox_dir / "gfx/config/gfxConfigManager.cpp"
+    if gcm_cpp.is_file():
+        orig = gcm_cpp.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        if "[Könfox Win7]" not in patched:
+            if '#  include "mozilla/WindowsVersion.h"' not in patched:
+                patched = patched.replace(
+                    '#  include "mozilla/gfx/DeviceManagerDx.h"',
+                    '#  include "mozilla/WindowsVersion.h"\n#  include "mozilla/gfx/DeviceManagerDx.h"',
+                    1,
+                )
+            patched = patched.replace(
+                "  mFeatureWrDComp->EnableByDefault();\n",
+                (
+                    "  mFeatureWrDComp->EnableByDefault();\n"
+                    "#ifdef XP_WIN\n"
+                    "  // [Könfox Win7] DirectComposition requires Windows 10+.\n"
+                    "  if (!mozilla::IsWin10OrLater()) {\n"
+                    "    mFeatureWrDComp->Disable(FeatureStatus::Unavailable,\n"
+                    '                             "DirectComposition requires Windows 10+",\n'
+                    '                             "FEATURE_FAILURE_WIN7_NO_DCOMP"_ns);\n'
+                    "  }\n"
+                    "#endif\n"
+                ),
+                1,
+            )
+        if patched != orig:
+            if not dry_run:
+                gcm_cpp.write_text(patched, encoding="utf-8")
+            touched.append(str(gcm_cpp.relative_to(firefox_dir)))
+
+    dm_cpp = firefox_dir / "gfx/thebes/DeviceManagerDx.cpp"
+    if dm_cpp.is_file():
+        orig = dm_cpp.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        if "[Könfox Win7]" not in patched:
+            if '#include "mozilla/WindowsVersion.h"' not in patched:
+                patched = patched.replace(
+                    '#include "DeviceManagerDx.h"',
+                    '#include "DeviceManagerDx.h"\n#include "mozilla/WindowsVersion.h"',
+                    1,
+                )
+            patched = patched.replace(
+                "  mFeatureLevels.AppendElement(D3D_FEATURE_LEVEL_11_1);",
+                (
+                    "  // [Könfox Win7] D3D_FEATURE_LEVEL_11_1 requires Windows 8+ (or Platform Update).\n"
+                    "  if (mozilla::IsWin8OrLater()) {\n"
+                    "    mFeatureLevels.AppendElement(D3D_FEATURE_LEVEL_11_1);\n"
+                    "  }"
+                ),
+                1,
+            )
+        if patched != orig:
+            if not dry_run:
+                dm_cpp.write_text(patched, encoding="utf-8")
+            touched.append(str(dm_cpp.relative_to(firefox_dir)))
+
+    return touched
+
+
+# ---------------------------------------------------------------------------
+# 23. WinRT / Startup / DPI / Widget / Geolocation Win7 guards
+# ---------------------------------------------------------------------------
+def patch_winrt_and_widget_win7(firefox_dir: Path, dry_run: bool) -> list[str]:
+    """
+    Guards all unguarded WinRT delay-load callers and Win8+/10+ widget/startup
+    code paths so Windows 7 SP1 never triggers 0xC06D007E delay-load crashes
+    on api-ms-win-core-winrt-*.dll, shcore.dll, or Microsoft.UI.*.dll.
+    """
+    touched: list[str] = []
+
+    # --- 23a. mozglue/misc/WindowsDpiInitialization.cpp ---
+    dpi_cpp = firefox_dir / "mozglue/misc/WindowsDpiInitialization.cpp"
+    if dpi_cpp.is_file():
+        orig = dpi_cpp.read_text(encoding="utf-8", errors="replace")
+        if "[Könfox Win7]" not in orig:
+            old_else = (
+                "  } else {\n"
+                "    DynamicallyLinkedFunctionPtr<SetProcessDpiAwarenessType>"
+            )
+            new_else = (
+                "  } else if (mozilla::IsWin8Point1OrLater()) {\n"
+                "    DynamicallyLinkedFunctionPtr<SetProcessDpiAwarenessType>"
+            )
+            old_end = (
+                "    return WindowsDpiInitializationResult::Success;\n"
+                "  }\n"
+                "}"
+            )
+            new_end = (
+                "    return WindowsDpiInitializationResult::Success;\n"
+                "  } else {\n"
+                "    // [Könfox Win7] Fallback to Vista/Win7 SetProcessDPIAware.\n"
+                "    ::SetProcessDPIAware();\n"
+                "    return WindowsDpiInitializationResult::Success;\n"
+                "  }\n"
+                "}"
+            )
+            if old_else in orig and old_end in orig:
+                patched = orig.replace(old_else, new_else, 1).replace(old_end, new_end, 1)
+                if not dry_run:
+                    dpi_cpp.write_text(patched, encoding="utf-8")
+                touched.append(str(dpi_cpp.relative_to(firefox_dir)))
+
+    # --- 23b. mozglue/misc/PreXULSkeletonUI.cpp ---
+    skel_cpp = firefox_dir / "mozglue/misc/PreXULSkeletonUI.cpp"
+    if skel_cpp.is_file():
+        orig = skel_cpp.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        if "[Könfox Win7]" not in patched:
+            if '#include "mozilla/WindowsVersion.h"' not in patched:
+                patched = patched.replace(
+                    '#include "PreXULSkeletonUI.h"',
+                    '#include "PreXULSkeletonUI.h"\n#include "mozilla/WindowsVersion.h"',
+                    1,
+                )
+            patched = patched.replace(
+                "static Result<Ok, PreXULSkeletonUIError> CreateAndStorePreXULSkeletonUIImpl(\n"
+                "    HINSTANCE hInstance, int argc, char** argv) {\n",
+                (
+                    "static Result<Ok, PreXULSkeletonUIError> CreateAndStorePreXULSkeletonUIImpl(\n"
+                    "    HINSTANCE hInstance, int argc, char** argv) {\n"
+                    "  // [Könfox Win7] Pre-XUL skeleton UI relies on Win10+ DWM/DPI APIs.\n"
+                    "  if (!mozilla::IsWin10OrLater()) {\n"
+                    "    return Err(PreXULSkeletonUIError::Disabled);\n"
+                    "  }\n"
+                ),
+                1,
+            )
+        if patched != orig:
+            if not dry_run:
+                skel_cpp.write_text(patched, encoding="utf-8")
+            touched.append(str(skel_cpp.relative_to(firefox_dir)))
+
+    # --- 23c. widget/windows/WindowsUIUtils.cpp ---
+    ui_cpp = firefox_dir / "widget/windows/WindowsUIUtils.cpp"
+    if ui_cpp.is_file():
+        orig = ui_cpp.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        if "[Könfox Win7]" not in patched:
+            patched = patched.replace(
+                "static IInspectable* GetUISettings() {\n",
+                (
+                    "static IInspectable* GetUISettings() {\n"
+                    "  // [Könfox Win7] WinRT UISettings requires Windows 10+.\n"
+                    "  if (!mozilla::IsWin10OrLater()) {\n"
+                    "    return nullptr;\n"
+                    "  }\n"
+                ),
+                1,
+            )
+            patched = patched.replace(
+                "void WindowsUIUtils::UpdateInWin10TabletMode() {\n"
+                "  if (IsWin11OrLater()) {",
+                (
+                    "void WindowsUIUtils::UpdateInWin10TabletMode() {\n"
+                    "  if (!mozilla::IsWin10OrLater() || mozilla::IsWin11OrLater()) {"
+                ),
+                1,
+            )
+            patched = patched.replace(
+                "Result<HStringUniquePtr, HRESULT> ConvertToWindowsString(\n"
+                "    const nsAString& aStr) {\n",
+                (
+                    "Result<HStringUniquePtr, HRESULT> ConvertToWindowsString(\n"
+                    "    const nsAString& aStr) {\n"
+                    "  if (!mozilla::IsWin10OrLater()) {\n"
+                    "    return Err(E_NOTIMPL);\n"
+                    "  }\n"
+                ),
+                1,
+            )
+            patched = patched.replace(
+                "static Result<Ok, nsresult> RequestShare(\n"
+                "    std::function<HRESULT(IDataRequestedEventArgs* pArgs)>&& aCallback) {\n",
+                (
+                    "static Result<Ok, nsresult> RequestShare(\n"
+                    "    std::function<HRESULT(IDataRequestedEventArgs* pArgs)>&& aCallback) {\n"
+                    "  if (!mozilla::IsWin10OrLater()) {\n"
+                    "    return Err(NS_ERROR_NOT_IMPLEMENTED);\n"
+                    "  }\n"
+                ),
+                1,
+            )
+            patched = patched.replace(
+                "  if (!StaticPrefs::widget_windows_windowsappsdk_enabled()) {",
+                (
+                    "  if (!mozilla::IsWin10OrLater() || !StaticPrefs::widget_windows_windowsappsdk_enabled()) {"
+                ),
+                1,
+            )
+        if patched != orig:
+            if not dry_run:
+                ui_cpp.write_text(patched, encoding="utf-8")
+            touched.append(str(ui_cpp.relative_to(firefox_dir)))
+
+    # --- 23d. widget/windows/OSKInputPaneManager.cpp ---
+    osk_cpp = firefox_dir / "widget/windows/OSKInputPaneManager.cpp"
+    if osk_cpp.is_file():
+        orig = osk_cpp.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        if "[Könfox Win7]" not in patched:
+            if '#include "mozilla/WindowsVersion.h"' not in patched:
+                patched = patched.replace(
+                    '#include "OSKInputPaneManager.h"',
+                    '#include "OSKInputPaneManager.h"\n#include "mozilla/WindowsVersion.h"',
+                    1,
+                )
+            patched = patched.replace(
+                "static ComPtr<IInputPane2> GetInputPane(HWND aHwnd) {\n",
+                (
+                    "static ComPtr<IInputPane2> GetInputPane(HWND aHwnd) {\n"
+                    "  // [Könfox Win7] WinRT InputPane requires Windows 10+.\n"
+                    "  if (!mozilla::IsWin10OrLater()) {\n"
+                    "    return nullptr;\n"
+                    "  }\n"
+                ),
+                1,
+            )
+        if patched != orig:
+            if not dry_run:
+                osk_cpp.write_text(patched, encoding="utf-8")
+            touched.append(str(osk_cpp.relative_to(firefox_dir)))
+
+    # --- 23e. widget/windows/WindowsSMTCProvider.cpp ---
+    smtc_cpp = firefox_dir / "widget/windows/WindowsSMTCProvider.cpp"
+    if smtc_cpp.is_file():
+        orig = smtc_cpp.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        if "[Könfox Win7]" not in patched:
+            if '#  include "mozilla/WindowsVersion.h"' not in patched:
+                patched = patched.replace(
+                    '#  include "WindowsSMTCProvider.h"',
+                    '#  include "WindowsSMTCProvider.h"\n#  include "mozilla/WindowsVersion.h"',
+                    1,
+                )
+            patched = patched.replace(
+                "bool WindowsSMTCProvider::Open() {\n",
+                (
+                    "bool WindowsSMTCProvider::Open() {\n"
+                    "  // [Könfox Win7] WinRT SystemMediaTransportControls requires Windows 10+.\n"
+                    "  if (!mozilla::IsWin10OrLater()) {\n"
+                    "    return false;\n"
+                    "  }\n"
+                ),
+                1,
+            )
+        if patched != orig:
+            if not dry_run:
+                smtc_cpp.write_text(patched, encoding="utf-8")
+            touched.append(str(smtc_cpp.relative_to(firefox_dir)))
+
+    # --- 23f. widget/windows/WinPointerEvents.cpp ---
+    ptr_cpp = firefox_dir / "widget/windows/WinPointerEvents.cpp"
+    if ptr_cpp.is_file():
+        orig = ptr_cpp.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        if "[Könfox Win7]" not in patched:
+            if '#include "mozilla/WindowsVersion.h"' not in patched:
+                patched = patched.replace(
+                    '#include "WinPointerEvents.h"',
+                    '#include "WinPointerEvents.h"\n#include "mozilla/WindowsVersion.h"',
+                    1,
+                )
+            patched = patched.replace(
+                "void WinPointerEvents::InitLibrary() {\n",
+                (
+                    "void WinPointerEvents::InitLibrary() {\n"
+                    "  // [Könfox Win7] WM_POINTER APIs require Windows 8+.\n"
+                    "  if (!mozilla::IsWin8OrLater()) {\n"
+                    "    return;\n"
+                    "  }\n"
+                ),
+                1,
+            )
+        if patched != orig:
+            if not dry_run:
+                ptr_cpp.write_text(patched, encoding="utf-8")
+            touched.append(str(ptr_cpp.relative_to(firefox_dir)))
+
+    # --- 23g. widget/windows/WinWindowOcclusionTracker.cpp ---
+    occ_cpp = firefox_dir / "widget/windows/WinWindowOcclusionTracker.cpp"
+    if occ_cpp.is_file():
+        orig = occ_cpp.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        if "[Könfox Win7]" not in patched:
+            if '#include "mozilla/WindowsVersion.h"' not in patched:
+                patched = patched.replace(
+                    '#include "WinWindowOcclusionTracker.h"',
+                    '#include "WinWindowOcclusionTracker.h"\n#include "mozilla/WindowsVersion.h"',
+                    1,
+                )
+            patched = patched.replace(
+                "void WinWindowOcclusionTracker::WindowOcclusionCalculator::Initialize() {\n",
+                (
+                    "void WinWindowOcclusionTracker::WindowOcclusionCalculator::Initialize() {\n"
+                    "  // [Könfox Win7] IVirtualDesktopManager requires Windows 10+.\n"
+                    "  if (!mozilla::IsWin10OrLater()) {\n"
+                    "    return;\n"
+                    "  }\n"
+                ),
+                1,
+            )
+        if patched != orig:
+            if not dry_run:
+                occ_cpp.write_text(patched, encoding="utf-8")
+            touched.append(str(occ_cpp.relative_to(firefox_dir)))
+
+    # --- 23h. widget/windows/nsWindowTaskbarConcealer.cpp ---
+    tb_cpp = firefox_dir / "widget/windows/nsWindowTaskbarConcealer.cpp"
+    if tb_cpp.is_file():
+        orig = tb_cpp.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        if "[Könfox Win7]" not in patched:
+            if '#include "mozilla/WindowsVersion.h"' not in patched:
+                patched = patched.replace(
+                    '#include "nsWindowTaskbarConcealer.h"',
+                    '#include "nsWindowTaskbarConcealer.h"\n#include "mozilla/WindowsVersion.h"',
+                    1,
+                )
+            patched = patched.replace(
+                "void nsWindow::TaskbarConcealer::OnAsyncStateUpdateRequest(HWND hwnd) {\n",
+                (
+                    "void nsWindow::TaskbarConcealer::OnAsyncStateUpdateRequest(HWND hwnd) {\n"
+                    "  // [Könfox Win7] Explorer rudeness workaround targets Win10/11.\n"
+                    "  if (!mozilla::IsWin10OrLater()) {\n"
+                    "    return;\n"
+                    "  }\n"
+                ),
+                1,
+            )
+        if patched != orig:
+            if not dry_run:
+                tb_cpp.write_text(patched, encoding="utf-8")
+            touched.append(str(tb_cpp.relative_to(firefox_dir)))
+
+    # --- 23i. toolkit/system/windowsPackageManager/nsWindowsPackageManager.cpp ---
+    wpm_cpp = firefox_dir / "toolkit/system/windowsPackageManager/nsWindowsPackageManager.cpp"
+    if wpm_cpp.is_file():
+        orig = wpm_cpp.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        if "[Könfox Win7]" not in patched:
+            if '#include "mozilla/WindowsVersion.h"' not in patched:
+                patched = patched.replace(
+                    '#include "nsWindowsPackageManager.h"',
+                    '#include "nsWindowsPackageManager.h"\n#include "mozilla/WindowsVersion.h"',
+                    1,
+                )
+            patched = patched.replace(
+                "nsWindowsPackageManager::FindUserInstalledPackages(\n"
+                "    const nsTArray<nsString>& aNamePrefixes, nsTArray<nsString>& aPackages) {\n",
+                (
+                    "nsWindowsPackageManager::FindUserInstalledPackages(\n"
+                    "    const nsTArray<nsString>& aNamePrefixes, nsTArray<nsString>& aPackages) {\n"
+                    "  // [Könfox Win7] WinRT PackageManager requires Windows 10+.\n"
+                    "  if (!mozilla::IsWin10OrLater()) {\n"
+                    "    return NS_ERROR_NOT_IMPLEMENTED;\n"
+                    "  }\n"
+                ),
+                1,
+            )
+            patched = patched.replace(
+                "nsWindowsPackageManager::GetInstalledDate(uint64_t* ts) {\n",
+                (
+                    "nsWindowsPackageManager::GetInstalledDate(uint64_t* ts) {\n"
+                    "  if (!mozilla::IsWin10OrLater()) {\n"
+                    "    return NS_ERROR_NOT_IMPLEMENTED;\n"
+                    "  }\n"
+                ),
+                1,
+            )
+        if patched != orig:
+            if not dry_run:
+                wpm_cpp.write_text(patched, encoding="utf-8")
+            touched.append(str(wpm_cpp.relative_to(firefox_dir)))
+
+    # --- 23j. toolkit/components/geolocation/GeolocationService.cpp ---
+    geo_cpp = firefox_dir / "toolkit/components/geolocation/GeolocationService.cpp"
+    if geo_cpp.is_file():
+        orig = geo_cpp.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        if "[Könfox Win7]" not in patched:
+            if '#  include "mozilla/WindowsVersion.h"' not in patched:
+                patched = patched.replace(
+                    '#  include "WindowsLocationProvider.h"',
+                    '#  include "WindowsLocationProvider.h"\n#  include "mozilla/WindowsVersion.h"',
+                    1,
+                )
+            patched = patched.replace(
+                '  if (Preferences::GetBool("geo.provider.ms-windows-location", false)) {',
+                (
+                    "  // [Könfox Win7] WinRT WindowsLocationProvider requires Windows 10+.\n"
+                    '  if (mozilla::IsWin10OrLater() && Preferences::GetBool("geo.provider.ms-windows-location", false)) {'
+                ),
+                1,
+            )
+        if patched != orig:
+            if not dry_run:
+                geo_cpp.write_text(patched, encoding="utf-8")
+            touched.append(str(geo_cpp.relative_to(firefox_dir)))
+
+    return touched
+
+
+# ---------------------------------------------------------------------------
+# 24. XPCOM AvailableMemoryTracker Win8.1+ HeapOptimizeResources guard
+# ---------------------------------------------------------------------------
+def patch_memory_tracker_win7(firefox_dir: Path, dry_run: bool) -> list[str]:
+    """
+    xpcom/base/AvailableMemoryTracker.cpp calls HeapSetInformation(...,
+    HeapOptimizeResources, ...) which was introduced in Windows 8.1.
+    """
+    touched: list[str] = []
+    amt_cpp = firefox_dir / "xpcom/base/AvailableMemoryTracker.cpp"
+    if not amt_cpp.is_file():
+        return touched
+
+    orig = amt_cpp.read_text(encoding="utf-8", errors="replace")
+    patched = orig
+    if "[Könfox Win7]" not in patched:
+        if '#  include "mozilla/WindowsVersion.h"' not in patched:
+            patched = patched.replace(
+                "#if defined(XP_WIN)\n",
+                '#if defined(XP_WIN)\n#  include "mozilla/WindowsVersion.h"\n',
+                1,
+            )
+        patched = patched.replace(
+            "void nsJemallocFreeDirtyPagesRunnable::OptimizeSystemHeap() {\n",
+            (
+                "void nsJemallocFreeDirtyPagesRunnable::OptimizeSystemHeap() {\n"
+                "  // [Könfox Win7] HeapOptimizeResources requires Windows 8.1+.\n"
+                "  if (!mozilla::IsWin8Point1OrLater()) {\n"
+                "    return;\n"
+                "  }\n"
+            ),
+            1,
+        )
+    if patched != orig:
+        if not dry_run:
+            amt_cpp.write_text(patched, encoding="utf-8")
+        touched.append(str(amt_cpp.relative_to(firefox_dir)))
+    return touched
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Apply Könfox Windows 7 SP1 x64 patches to a Firefox Nightly checkout."
@@ -1296,6 +2690,15 @@ def main() -> int:
         ("Profiler ETW dynamic EventSetInformation", lambda: patch_etw_tracelogging_win7(args.firefox_dir, args.dry_run)),
         ("llama.cpp SetThreadInformation dynamic load", lambda: patch_llama_cpp_win7(args.firefox_dir, args.dry_run)),
         ("Vendored Rust crate scan", lambda: patch_vendored_rust_crates(args.firefox_dir, args.dry_run)),
+        ("konfox.exe Win7 RT_MANIFEST", lambda: patch_konfox_app_manifest(args.firefox_dir, args.dry_run)),
+        ("combase.dll removal (windows-core/sys + AgileReference)", lambda: patch_combase_and_agile_reference(args.firefox_dir, args.dry_run)),
+        ("SpiderMonkey JIT RtlAddGrowableFunctionTable Win7 fallback", lambda: patch_jit_unwind_win7(args.firefox_dir, args.dry_run)),
+        ("Dynamic GetCurrentApplicationUserModelId & nsWindow guards", lambda: patch_aumid_dynamic_load(args.firefox_dir, args.dry_run)),
+        ("Win7 PRNG fallback (RandomNum + Chromium rand_util_win)", lambda: patch_win7_prng_fallbacks(args.firefox_dir, args.dry_run)),
+        ("Chromium Sandbox & SandboxBroker Win7 runtime fixes", lambda: patch_chromium_sandbox_runtime_win7(args.firefox_dir, args.dry_run)),
+        ("Graphics Win7 fixes (DirectComposition & D3D 11.1)", lambda: patch_graphics_win7(args.firefox_dir, args.dry_run)),
+        ("WinRT, DPI, SkeletonUI & Widget Win7 guards", lambda: patch_winrt_and_widget_win7(args.firefox_dir, args.dry_run)),
+        ("AvailableMemoryTracker HeapOptimizeResources Win7 guard", lambda: patch_memory_tracker_win7(args.firefox_dir, args.dry_run)),
         ("patches/series", lambda: apply_patch_series(args.firefox_dir, args.patches_dir, args.dry_run)),
     ):
         touched = fn()
