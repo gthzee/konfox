@@ -22,13 +22,14 @@ permissions:
 
 jobs:
   # ===========================================================================
-  # Job 1: Build & cache the Win7-patched Linux->Windows Rust toolchain
-  # Runs on FREE GitHub-hosted ubuntu-24.04 (4 vCPU, 16 GB RAM on public repos)
+  # Job 1: Build & cache Win7-patched Rust stdlib (~2–3 min, 21 MB cache!)
+  # Uses official rustup rustc + rustc-<ver>-src.tar.xz + local-rebuild = true
+  # (zero LLVM compilation, zero rustc compilation, zero git HEAD^1 panic).
   # ===========================================================================
   build-patched-rust:
-    name: Build & Cache Win7-Patched Rust
+    name: Build & Cache Win7-Patched Rust stdlib
     runs-on: ubuntu-24.04
-    timeout-minutes: 240
+    timeout-minutes: 60
     outputs:
       rust_version: ${{ steps.detect.outputs.rust_version }}
       cache_key: ${{ steps.detect.outputs.cache_key }}
@@ -54,43 +55,42 @@ jobs:
           fi
           echo "Detected Rust version: $RV"
           echo "rust_version=$RV" >> "$GITHUB_OUTPUT"
-          echo "cache_key=konfox-rust-win7-${RV}-v1" >> "$GITHUB_OUTPUT"
+          echo "cache_key=konfox-rust-std-win7-${RV}-v2" >> "$GITHUB_OUTPUT"
 
-      - name: Check cache for prebuilt Win7-patched Rust toolchain
+      - name: Check cache for prebuilt Win7-patched Rust stdlib
         id: rust-cache
         uses: actions/cache@v4
         with:
           path: /tmp/rust-win7-cache
           key: ${{ steps.detect.outputs.cache_key }}
 
-      - name: Free runner disk space (~40+ GB)
-        if: steps.rust-cache.outputs.cache-hit != 'true'
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: false
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: true
-
-      - name: Install Rust cross-build dependencies (clang-cl, lld-link, xwin 0.10.0)
+      - name: Install clang, lld, llvm, xwin 0.10.0, and official Rust toolchain
         if: steps.rust-cache.outputs.cache-hit != 'true'
         run: |
+          set -euo pipefail
+          RV="${{ steps.detect.outputs.rust_version }}"
           sudo apt-get update
-          sudo apt-get install -y clang lld llvm cmake ninja-build curl xz-utils zstd python3 git
-          # xwin 0.10.0+ fixes Microsoft's VS 17/18 manifest path-separator & onecore-uap header changes
+          sudo apt-get install -y clang lld llvm curl xz-utils zstd python3
+
+          # Install exact official Rust version (rustc + cargo match rustc-$RV-src.tar.xz)
+          rustup toolchain install "$RV" --profile minimal --no-self-update
+          rustup default "$RV"
+          rustc --version
+          cargo --version
+
+          # xwin 0.10.0+ handles Microsoft's VS 17/18 manifest path separators & onecore-uap headers
           XWIN_VER="0.10.0"
           curl -fsSL "https://github.com/Jake-Shadle/xwin/releases/download/${XWIN_VER}/xwin-${XWIN_VER}-x86_64-unknown-linux-musl.tar.gz" \
             | tar -xz --strip-components=1 -C /tmp "xwin-${XWIN_VER}-x86_64-unknown-linux-musl/xwin"
           /tmp/xwin --accept-license --arch x86_64 splat --output /tmp/xwin-sysroot
           rm -rf .xwin-cache /tmp/xwin
 
-          # Wrapper scripts guarantee x.py always passes xwin include/lib paths at every bootstrap stage
-          cat > /tmp/clang-cl-xwin <<'WRAP'
+          # Wrapper named literally `clang-cl` so cc-rs detects MSVC mode;
+          # invokes `clang --driver-mode=cl` (Ubuntu 24.04 ships no `clang-cl` symlink).
+          mkdir -p /tmp/xwin-bin
+          cat > /tmp/xwin-bin/clang-cl <<'WRAP'
           #!/usr/bin/env bash
-          exec clang-cl \
+          exec clang --driver-mode=cl --target=x86_64-pc-windows-msvc \
             -Wno-unused-command-line-argument \
             /imsvc/tmp/xwin-sysroot/crt/include \
             /imsvc/tmp/xwin-sysroot/sdk/include/ucrt \
@@ -98,57 +98,106 @@ jobs:
             /imsvc/tmp/xwin-sysroot/sdk/include/shared \
             "$@"
           WRAP
-          cat > /tmp/lld-link-xwin <<'WRAP'
+          cat > /tmp/xwin-bin/lld-link <<'WRAP'
           #!/usr/bin/env bash
+          if [[ "${1:-}" == "-flavor" && "${2:-}" == "link" ]]; then
+            shift 2
+          fi
           exec lld-link \
             /libpath:/tmp/xwin-sysroot/crt/lib/x86_64 \
             /libpath:/tmp/xwin-sysroot/sdk/lib/um/x86_64 \
             /libpath:/tmp/xwin-sysroot/sdk/lib/ucrt/x86_64 \
             "$@"
           WRAP
-          chmod +x /tmp/clang-cl-xwin /tmp/lld-link-xwin
+          chmod +x /tmp/xwin-bin/clang-cl /tmp/xwin-bin/lld-link
 
-      - name: Clone, patch, and build Win7-compatible Rust toolchain
+          # Smoke-test wrapper before building
+          echo '#include <windows.h>' | /tmp/xwin-bin/clang-cl /E - >/dev/null
+          echo "clang-cl wrapper verified OK!"
+
+      - name: Patch, build, and Win7-PE-verify x86_64-pc-windows-msvc stdlib
         if: steps.rust-cache.outputs.cache-hit != 'true'
         run: |
+          set -euo pipefail
           RV="${{ steps.detect.outputs.rust_version }}"
-          git clone --depth 1 --branch "$RV" https://github.com/rust-lang/rust.git /tmp/rust-src
-          git -C /tmp/rust-src submodule update --init --recursive --depth 1
+          RUSTC_BIN="$(rustup which --toolchain "$RV" rustc)"
+          CARGO_BIN="$(rustup which --toolchain "$RV" cargo)"
+          OFFICIAL_SYSROOT="$("$RUSTC_BIN" --print sysroot)"
 
+          # Download official source tarball (vendored crates included; no .git -> zero HEAD^1 error)
+          curl -fsSL "https://static.rust-lang.org/dist/rustc-${RV}-src.tar.xz" | tar -xJ -C /tmp
+          mv "/tmp/rustc-${RV}-src" /tmp/rust-src
+
+          # Apply version-agnostic Win7 stdlib patches (std, windows_link/windows_targets, backtrace)
           python3 scripts/patch_rust_win7.py --strict /tmp/rust-src
 
-          cat > /tmp/rust-src/bootstrap.toml <<'EOF'
-          profile = "compiler"
+          cat > /tmp/rust-src/bootstrap.toml <<EOF
           change-id = "ignore"
 
           [llvm]
-          download-ci-llvm = true
+          download-ci-llvm = false
 
           [build]
+          build = "x86_64-unknown-linux-gnu"
           host = ["x86_64-unknown-linux-gnu"]
           target = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+          rustc = "${RUSTC_BIN}"
+          cargo = "${CARGO_BIN}"
+          local-rebuild = true
           docs = false
-          extended = true
-          tools = ["cargo"]
+          submodules = false
+          locked-deps = true
+          vendor = true
+          extended = false
 
-          [install]
-          prefix = "/tmp/rust-win7-dist"
-          sysconfdir = "etc"
+          [rust]
+          channel = "stable"
+          deny-warnings = false
+          lld = false
 
           [target.x86_64-pc-windows-msvc]
-          cc = "/tmp/clang-cl-xwin"
-          cxx = "/tmp/clang-cl-xwin"
+          cc = "/tmp/xwin-bin/clang-cl"
+          cxx = "/tmp/xwin-bin/clang-cl"
           ar = "llvm-lib"
-          linker = "/tmp/lld-link-xwin"
+          linker = "/tmp/xwin-bin/lld-link"
           EOF
 
-          export CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER="/tmp/lld-link-xwin"
+          export CC_x86_64_pc_windows_msvc="/tmp/xwin-bin/clang-cl"
+          export CXX_x86_64_pc_windows_msvc="/tmp/xwin-bin/clang-cl"
+          export AR_x86_64_pc_windows_msvc="llvm-lib"
+
           cd /tmp/rust-src
-          python3 x.py install compiler library cargo
+          python3 x.py dist --stage 0 rust-std --target x86_64-pc-windows-msvc --warnings=warn
 
           mkdir -p /tmp/rust-win7-cache
-          tar --zstd -cf /tmp/rust-win7-cache/rust-win7-toolchain.tar.zst -C /tmp/rust-win7-dist .
-          ls -lh /tmp/rust-win7-cache/rust-win7-toolchain.tar.zst
+          cp -v "build/dist/rust-std-${RV}-x86_64-pc-windows-msvc.tar.xz" /tmp/rust-win7-cache/
+
+          # Self-verify assembled toolchain with a real Windows .exe + verify_win7_pe.py!
+          cd "$GITHUB_WORKSPACE"
+          cp -a "$OFFICIAL_SYSROOT" /tmp/rust-win7-verify
+          mkdir -p /tmp/std-unpack
+          tar -xJf "/tmp/rust-win7-cache/rust-std-${RV}-x86_64-pc-windows-msvc.tar.xz" -C /tmp/std-unpack
+          "/tmp/std-unpack/rust-std-${RV}-x86_64-pc-windows-msvc/install.sh" \
+            --prefix=/tmp/rust-win7-verify --disable-ldconfig
+
+          cat > /tmp/smoke.rs <<'RS'
+          use std::collections::HashMap;
+          use std::sync::{Arc, Condvar, Mutex};
+          use std::time::SystemTime;
+          fn main() {
+              let mut m = HashMap::new();
+              m.insert("browser", "Konfox");
+              let pair = Arc::new((Mutex::new(false), Condvar::new()));
+              let _g = pair.0.lock().unwrap();
+              println!("{:?} {:?}", m.get("browser"), SystemTime::now());
+          }
+          RS
+          /tmp/rust-win7-verify/bin/rustc \
+            --target x86_64-pc-windows-msvc \
+            -C linker=/tmp/xwin-bin/lld-link \
+            -O /tmp/smoke.rs -o /tmp/smoke.exe
+          python3 scripts/verify_win7_pe.py /tmp/smoke.exe
+          python3 scripts/verify_win7_pe.py /tmp/rust-win7-verify/lib/rustlib/x86_64-pc-windows-msvc/lib/
 
   # ===========================================================================
   # Job 2: Cross-compile Könfox Nightly (Win7 SP1 x64), audit PEs, package .exe
@@ -183,27 +232,40 @@ jobs:
           free -h
           df -h /
 
-      - name: Install Linux->Windows cross-compile packages
+      - name: Install Linux->Windows cross-compile & NSIS packaging packages
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             git python3 python3-pip curl msitools cmake ninja-build \
-            zip xz-utils zstd build-essential pkg-config librsvg2-bin imagemagick
+            nsis p7zip-full zip xz-utils zstd build-essential pkg-config \
+            librsvg2-bin imagemagick
 
-      - name: Restore Win7-patched Rust toolchain from cache
+      - name: Restore Win7-patched Rust stdlib from cache
         uses: actions/cache@v4
         with:
           path: /tmp/rust-win7-cache
           key: ${{ needs.build-patched-rust.outputs.cache_key }}
 
-      - name: Unpack Win7-patched Rust toolchain
+      - name: Assemble standalone Win7-patched Rust toolchain
         run: |
-          mkdir -p /tmp/rust-win7-dist
-          tar --zstd -xf /tmp/rust-win7-cache/rust-win7-toolchain.tar.zst -C /tmp/rust-win7-dist
+          set -euo pipefail
+          RV="${{ needs.build-patched-rust.outputs.rust_version }}"
+          rustup toolchain install "$RV" --profile minimal --no-self-update
+          RUSTC_BIN="$(rustup which --toolchain "$RV" rustc)"
+          OFFICIAL_SYSROOT="$("$RUSTC_BIN" --print sysroot)"
+
+          cp -a "$OFFICIAL_SYSROOT" /tmp/rust-win7-dist
+          mkdir -p /tmp/std-unpack
+          tar -xJf "/tmp/rust-win7-cache/rust-std-${RV}-x86_64-pc-windows-msvc.tar.xz" -C /tmp/std-unpack
+          "/tmp/std-unpack/rust-std-${RV}-x86_64-pc-windows-msvc/install.sh" \
+            --prefix=/tmp/rust-win7-dist --disable-ldconfig
+          rm -rf /tmp/std-unpack
+
           /tmp/rust-win7-dist/bin/rustc --version
           /tmp/rust-win7-dist/bin/cargo --version
+          /tmp/rust-win7-dist/bin/rustc --print target-libdir --target x86_64-pc-windows-msvc
 
-      - name: Fetch, bootstrap, patch, build, package, and audit Könfox Nightly
+      - name: Fetch, patch, bootstrap, build, package, and audit Könfox Nightly
         env:
           MOZBUILD_STATE_PATH: /tmp/mozbuild
         run: |
@@ -219,9 +281,11 @@ jobs:
             all
 
       - name: Upload Könfox Nightly Windows 7 x64 Installer & Portable ZIP
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
           name: konfox-nightly-win7-x64
+          if-no-files-found: warn
           path: |
             out/*.installer.exe
             out/*.zip
@@ -230,7 +294,7 @@ jobs:
           retention-days: 30
 
       - name: Publish GitHub Release (optional)
-        if: inputs.create_release == true
+        if: success() && inputs.create_release == true
         uses: softprops/action-gh-release@v2
         with:
           tag_name: konfox-nightly-${{ github.run_number }}
@@ -239,6 +303,7 @@ jobs:
           body: |
             Automated Linux -> Windows 7 SP1 x64 cross-compile of **Könfox Nightly** (based on `mozilla-firefox/firefox@${{ inputs.firefox_ref }}`, built with Win7-patched Rust `${{ needs.build-patched-rust.outputs.rust_version }}`).
 
+            - PE Subsystem version: **6.01 (Windows 7 SP1)**
             - Windows content sandbox: **Enabled**
             - Bundled MSVC CRT + UCRT DLLs: **Included**
             - Automated Win7 PE32+ import audit: see attached `win7-pe-audit.txt`
