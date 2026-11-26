@@ -36,6 +36,7 @@ from pathlib import Path
 # so compiler/rustc internals and unrelated tests are untouched.
 TARGET_SUBTREES = (
     Path("library/std/src"),
+    Path("library/windows_link/src"),
     Path("library/windows_targets/src"),
     Path("library/backtrace/src"),
 )
@@ -73,6 +74,11 @@ def patch_rust_tree(rust_dir: Path, dry_run: bool = False) -> dict[str, tuple[in
     for subtree in TARGET_SUBTREES:
         base = rust_dir / subtree
         if not base.is_dir():
+            # Rust 1.100+ replaced windows_targets with windows_link; only warn if neither exists
+            if subtree == Path("library/windows_targets/src") and (rust_dir / "library/windows_link/src").is_dir():
+                continue
+            if subtree == Path("library/windows_link/src") and (rust_dir / "library/windows_targets/src").is_dir():
+                continue
             print(f"[warn] subtree not found (submodule missing?): {base}", file=sys.stderr)
             continue
         for rs_file in sorted(base.rglob("*.rs")):

@@ -15,7 +15,7 @@
 #   --low-disk                Prune downloaded .tar.zst toolchain archives to save disk space
 #
 # Stages (default: all):
-#   check | fetch | bootstrap | rust | patch | build | package | verify | all
+#   check | fetch | patch | bootstrap | rust | build | package | verify | all
 # =============================================================================
 
 set -euo pipefail
@@ -52,7 +52,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 FIREFOX_DIR="${WORK_DIR}/firefox"
-RUST_SRC_DIR="${WORK_DIR}/rust"
+RUST_SRC_DIR="${WORK_DIR}/rust-src"
 [[ -n "$RUST_DIST_DIR" ]] || RUST_DIST_DIR="${WORK_DIR}/rust-win7-toolchain"
 MOZBUILD_DIR="${MOZBUILD_STATE_PATH:-${HOME}/.mozbuild}"
 export MOZBUILD_STATE_PATH="$MOZBUILD_DIR"
@@ -75,12 +75,12 @@ stage_check() {
     [[ "$(uname -m)" == "x86_64" ]] || die "Expected x86_64 Linux host."
 
     local missing=()
-    for cmd in git python3 curl msiextract cmake ninja zip tar xz; do
+    for cmd in git python3 curl msiextract cmake ninja zip tar xz makensis 7z; do
         command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
     done
     if [[ ${#missing[@]} -gt 0 ]]; then
         die "Missing host tools: ${missing[*]}. On Debian/Ubuntu run:
-  sudo apt update && sudo apt install -y git python3 python3-pip curl msitools cmake ninja-build zip xz-utils build-essential pkg-config librsvg2-bin imagemagick"
+  sudo apt update && sudo apt install -y git python3 python3-pip curl msitools cmake ninja-build nsis p7zip-full zip xz-utils zstd build-essential pkg-config librsvg2-bin imagemagick"
     fi
 
     local ram_gb avail_gb
@@ -90,8 +90,8 @@ stage_check() {
     if [[ "$ram_gb" -lt 14 ]]; then
         warn "RAM is ${ram_gb} GiB (< 16 GiB). Linking xul.dll may OOM unless you add swap (e.g. 16–24 GiB swapfile)."
     fi
-    if [[ "$avail_gb" -lt 50 ]]; then
-        warn "Free disk is ${avail_gb} GiB (< 50 GiB). Full Firefox Nightly + Rust cross-build typically needs 50–80 GiB."
+    if [[ "$avail_gb" -lt 45 ]]; then
+        warn "Free disk is ${avail_gb} GiB (< 45 GiB). Full Firefox Nightly cross-build typically needs 45–65 GiB."
     fi
 }
 
@@ -123,13 +123,21 @@ PY
     fi
 }
 
+stage_patch() {
+    log "Installing Könfox Nightly branding..."
+    python3 "${ROOT_DIR}/scripts/apply_branding.py" "$FIREFOX_DIR"
+
+    log "Applying Könfox Windows 7 SP1 x64 patches..."
+    python3 "${ROOT_DIR}/scripts/apply_win7_patches.py" "$FIREFOX_DIR"
+}
+
 stage_bootstrap() {
-    log "Bootstrapping Mozilla Linux->Windows cross-compile toolchains (clang-cl, lld-link, VS sysroot)..."
+    log "Bootstrapping Mozilla Linux->Windows cross-compile toolchains (clang-cl, lld-link, node, nasm, cbindgen)..."
     mkdir -p "$WORK_DIR" "$MOZBUILD_DIR"
     pushd "$FIREFOX_DIR" >/dev/null
     MOZCONFIG="$MOZCONFIG_FILE" ./mach --no-interactive bootstrap \
         --application-choice=browser \
-        --no-system-changes || warn "mach bootstrap reported non-fatal warning; verifying sysroot during configure..."
+        --no-system-changes || warn "mach bootstrap reported non-fatal warning; continuing to configure..."
     popd >/dev/null
 
     if [[ "$LOW_DISK" -eq 1 ]]; then
@@ -140,92 +148,117 @@ stage_bootstrap() {
 
 stage_rust() {
     if [[ "$SKIP_RUST" -eq 1 && -x "${RUST_DIST_DIR}/bin/rustc" ]]; then
-        log "Reusing existing patched Rust toolchain at ${RUST_DIST_DIR}"
+        log "Reusing existing Win7-patched Rust toolchain at ${RUST_DIST_DIR}"
         return 0
     fi
 
     [[ -n "$RUST_VERSION" ]] || RUST_VERSION="1.100.0"
-    log "Preparing patched Rust ${RUST_VERSION} (Linux host -> Win7-compatible x86_64-pc-windows-msvc target)..."
+    log "Building Win7-patched Rust ${RUST_VERSION} x86_64-pc-windows-msvc stdlib (fast stage-0 local-rebuild)..."
 
-    if [[ ! -d "$RUST_SRC_DIR/.git" ]]; then
-        git clone --depth 1 --branch "$RUST_VERSION" https://github.com/rust-lang/rust.git "$RUST_SRC_DIR"
-    else
-        git -C "$RUST_SRC_DIR" fetch --depth 1 origin tag "$RUST_VERSION"
-        git -C "$RUST_SRC_DIR" checkout -f "$RUST_VERSION"
-        git -C "$RUST_SRC_DIR" reset --hard HEAD
-    fi
-    git -C "$RUST_SRC_DIR" submodule update --init --recursive --depth 1
+    # Ensure official rustup toolchain for $RUST_VERSION is installed
+    command -v rustup >/dev/null 2>&1 || die "rustup not found (install via https://rustup.rs)"
+    rustup toolchain install "${RUST_VERSION}" --profile minimal
+    local rustc_bin cargo_bin official_sysroot
+    rustc_bin="$(rustup which --toolchain "${RUST_VERSION}" rustc)"
+    cargo_bin="$(rustup which --toolchain "${RUST_VERSION}" cargo)"
+    official_sysroot="$("${rustc_bin}" --print sysroot)"
+
+    # Download official source tarball (no .git -> avoids HEAD^1 bootstrap panic, includes vendored crates)
+    rm -rf "$RUST_SRC_DIR"
+    mkdir -p "$WORK_DIR"
+    curl -fsSL "https://static.rust-lang.org/dist/rustc-${RUST_VERSION}-src.tar.xz" | tar -xJ -C "$WORK_DIR"
+    mv "${WORK_DIR}/rustc-${RUST_VERSION}-src" "$RUST_SRC_DIR"
 
     log "Applying version-agnostic Win7 stdlib patches to Rust ${RUST_VERSION}..."
-    python3 "${ROOT_DIR}/scripts/patch_rust_win7.py" "$RUST_SRC_DIR"
+    python3 "${ROOT_DIR}/scripts/patch_rust_win7.py" --strict "$RUST_SRC_DIR"
 
+    # Build wrapper scripts pointing clang --driver-mode=cl & lld-link at bootstrapped VS sysroot
+    local vs_dir="${MOZBUILD_DIR}/vs"
     local clang_bin="${MOZBUILD_DIR}/clang/bin"
-    local cc_win="clang-cl"
-    local ar_win="llvm-lib"
-    local ld_win="lld-link"
-    if [[ -x "${clang_bin}/clang-cl" ]]; then
-        cc_win="${clang_bin}/clang-cl"
-        ar_win="${clang_bin}/llvm-lib"
-        ld_win="${clang_bin}/lld-link"
-    fi
+    local clang_exe="clang"
+    local ar_exe="llvm-lib"
+    local lld_exe="lld-link"
+    [[ -x "${clang_bin}/clang" ]] && clang_exe="${clang_bin}/clang"
+    [[ -x "${clang_bin}/llvm-lib" ]] && ar_exe="${clang_bin}/llvm-lib"
+    [[ -x "${clang_bin}/lld-link" ]] && lld_exe="${clang_bin}/lld-link"
+
+    local vc_inc ucrt_inc um_inc shared_inc vc_lib ucrt_lib um_lib
+    vc_inc=$(find "$vs_dir" -type d -path "*/VC/Tools/MSVC/*/include" | head -n1 || true)
+    ucrt_inc=$(find "$vs_dir" -type d -path "*/Windows Kits/10/Include/*/ucrt" | head -n1 || true)
+    um_inc=$(find "$vs_dir" -type d -path "*/Windows Kits/10/Include/*/um" | head -n1 || true)
+    shared_inc=$(find "$vs_dir" -type d -path "*/Windows Kits/10/Include/*/shared" | head -n1 || true)
+    vc_lib=$(find "$vs_dir" -type d -path "*/VC/Tools/MSVC/*/lib/x64" | head -n1 || true)
+    ucrt_lib=$(find "$vs_dir" -type d -path "*/Windows Kits/10/Lib/*/ucrt/x64" | head -n1 || true)
+    um_lib=$(find "$vs_dir" -type d -path "*/Windows Kits/10/Lib/*/um/x64" | head -n1 || true)
+    [[ -n "$vc_lib" && -n "$ucrt_lib" && -n "$um_lib" ]] || die "Windows SDK not found in ${vs_dir}; run ./mach configure or install xwin."
+
+    local wrap_dir="${WORK_DIR}/rust-win7-wrappers"
+    mkdir -p "$wrap_dir"
+    cat > "${wrap_dir}/clang-cl" <<WRAP
+#!/usr/bin/env bash
+exec "${clang_exe}" --driver-mode=cl --target=x86_64-pc-windows-msvc \\
+  -Wno-unused-command-line-argument \\
+  "/imsvc${vc_inc}" "/imsvc${ucrt_inc}" "/imsvc${um_inc}" "/imsvc${shared_inc}" "\$@"
+WRAP
+    cat > "${wrap_dir}/lld-link" <<WRAP
+#!/usr/bin/env bash
+if [[ "\${1:-}" == "-flavor" && "\${2:-}" == "link" ]]; then shift 2; fi
+exec "${lld_exe}" \\
+  "/libpath:${vc_lib}" "/libpath:${um_lib}" "/libpath:${ucrt_lib}" "\$@"
+WRAP
+    chmod +x "${wrap_dir}/clang-cl" "${wrap_dir}/lld-link"
 
     cat > "${RUST_SRC_DIR}/bootstrap.toml" <<EOF
-profile = "compiler"
 change-id = "ignore"
 
 [llvm]
-download-ci-llvm = true
+download-ci-llvm = false
 
 [build]
+build = "x86_64-unknown-linux-gnu"
 host = ["x86_64-unknown-linux-gnu"]
 target = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+rustc = "${rustc_bin}"
+cargo = "${cargo_bin}"
+local-rebuild = true
 docs = false
-extended = true
-tools = ["cargo"]
+submodules = false
+locked-deps = true
+vendor = true
+extended = false
 
-[install]
-prefix = "${RUST_DIST_DIR}"
-sysconfdir = "etc"
+[rust]
+channel = "stable"
+deny-warnings = false
+lld = false
 
 [target.x86_64-pc-windows-msvc]
-cc = "${cc_win}"
-cxx = "${cc_win}"
-ar = "${ar_win}"
-linker = "${ld_win}"
+cc = "${wrap_dir}/clang-cl"
+cxx = "${wrap_dir}/clang-cl"
+ar = "${ar_exe}"
+linker = "${wrap_dir}/lld-link"
 EOF
 
-    local vs_dir="${MOZBUILD_DIR}/vs"
-    if [[ -d "$vs_dir" ]]; then
-        local vc_lib ucrt_lib um_lib
-        vc_lib=$(find "$vs_dir" -type d -path "*/VC/Tools/MSVC/*/lib/x64" | head -n1 || true)
-        ucrt_lib=$(find "$vs_dir" -type d -path "*/Windows Kits/10/Lib/*/ucrt/x64" | head -n1 || true)
-        um_lib=$(find "$vs_dir" -type d -path "*/Windows Kits/10/Lib/*/um/x64" | head -n1 || true)
-        if [[ -n "$vc_lib" && -n "$ucrt_lib" && -n "$um_lib" ]]; then
-            export RUSTFLAGS="-L native=${vc_lib} -L native=${ucrt_lib} -L native=${um_lib}"
-            log "Configured Windows SDK lib paths from ${vs_dir} for Rust target stdlib"
-        fi
-    fi
-
     pushd "$RUST_SRC_DIR" >/dev/null
-    log "Building patched rustc, cargo, and Win7-compatible x86_64-pc-windows-msvc stdlib..."
-    python3 x.py install compiler library cargo
+    CC_x86_64_pc_windows_msvc="${wrap_dir}/clang-cl" \
+    CXX_x86_64_pc_windows_msvc="${wrap_dir}/clang-cl" \
+    AR_x86_64_pc_windows_msvc="${ar_exe}" \
+    python3 x.py dist --stage 0 rust-std --target x86_64-pc-windows-msvc --warnings=warn
     popd >/dev/null
 
-    [[ -x "${RUST_DIST_DIR}/bin/rustc" ]] || die "Patched rustc was not installed to ${RUST_DIST_DIR}/bin/rustc"
+    rm -rf "$RUST_DIST_DIR" "${WORK_DIR}/std-unpack"
+    cp -a "$official_sysroot" "$RUST_DIST_DIR"
+    mkdir -p "${WORK_DIR}/std-unpack"
+    tar -xJf "${RUST_SRC_DIR}/build/dist/rust-std-${RUST_VERSION}-x86_64-pc-windows-msvc.tar.xz" -C "${WORK_DIR}/std-unpack"
+    "${WORK_DIR}/std-unpack/rust-std-${RUST_VERSION}-x86_64-pc-windows-msvc/install.sh" \
+        --prefix="$RUST_DIST_DIR" --disable-ldconfig
+
+    [[ -x "${RUST_DIST_DIR}/bin/rustc" ]] || die "Patched rustc missing at ${RUST_DIST_DIR}/bin/rustc"
     log "Patched Rust ready: $("${RUST_DIST_DIR}/bin/rustc" --version)"
 
     if [[ "$LOW_DISK" -eq 1 ]]; then
-        log "Cleaning Rust source/build directory (${RUST_SRC_DIR}) to reclaim disk space..."
-        rm -rf "$RUST_SRC_DIR"
+        rm -rf "$RUST_SRC_DIR" "${WORK_DIR}/std-unpack"
     fi
-}
-
-stage_patch() {
-    log "Installing Könfox Nightly branding..."
-    python3 "${ROOT_DIR}/scripts/apply_branding.py" "$FIREFOX_DIR"
-
-    log "Applying Könfox Windows 7 SP1 x64 patches..."
-    python3 "${ROOT_DIR}/scripts/apply_win7_patches.py" "$FIREFOX_DIR"
 }
 
 export_build_env() {
@@ -238,23 +271,35 @@ export_build_env() {
 
     local vs_dir="${MOZBUILD_DIR}/vs"
     if [[ -d "$vs_dir" ]]; then
-        KONFOX_VC_REDIST_DIR=$(find "$vs_dir" -type d -path "*/VC/Redist/MSVC/*/x64/Microsoft.VC*.CRT" | head -n1 || true)
         KONFOX_UCRT_REDIST_DIR=$(find "$vs_dir" -type d -path "*/Windows Kits/10/Redist/*/ucrt/DLLs/x64" | head -n1 || true)
-        export KONFOX_VC_REDIST_DIR KONFOX_UCRT_REDIST_DIR
-        [[ -n "$KONFOX_VC_REDIST_DIR" ]] && log "Bundling MSVC CRT from: ${KONFOX_VC_REDIST_DIR}"
+        export KONFOX_UCRT_REDIST_DIR
         [[ -n "$KONFOX_UCRT_REDIST_DIR" ]] && log "Bundling UCRT DLLs from: ${KONFOX_UCRT_REDIST_DIR}"
     fi
 }
 
 stage_build() {
     export_build_env
-    log "Cross-compiling Könfox Nightly (${PROFILE}) for Windows 7 SP1 x64..."
+    log "Configuring & cross-compiling Könfox Nightly (${PROFILE}) for Windows 7 SP1 x64..."
     pushd "$FIREFOX_DIR" >/dev/null
-    # Ensure VS sysroot is downloaded first so CRT/UCRT redist dirs exist before configure
-    if [[ ! -d "${MOZBUILD_DIR}/vs" ]]; then
-        ./mach configure || true
+    local had_vs=0
+    [[ -d "${MOZBUILD_DIR}/vs" ]] && had_vs=1
+
+    ./mach configure
+
+    # If --enable-bootstrap just downloaded ~/.mozbuild/vs on first configure,
+    # pick up UCRT redist DLLs and re-run fast configure so UCRT gets packaged.
+    if [[ "$had_vs" -eq 0 && -d "${MOZBUILD_DIR}/vs" ]]; then
         export_build_env
+        if [[ -n "${KONFOX_UCRT_REDIST_DIR:-}" ]]; then
+            log "Re-configuring with bundled UCRT redist dir..."
+            ./mach configure
+        fi
     fi
+
+    if [[ "$LOW_DISK" -eq 1 ]]; then
+        rm -rf "${MOZBUILD_DIR}/toolchains"
+    fi
+
     ./mach build
     popd >/dev/null
 }
@@ -287,18 +332,18 @@ stage_verify() {
 case "$STAGE" in
     check)     stage_check ;;
     fetch)     stage_fetch ;;
+    patch)     stage_patch ;;
     bootstrap) stage_bootstrap ;;
     rust)      stage_rust ;;
-    patch)     stage_patch ;;
     build)     stage_build ;;
     package)   stage_package ;;
     verify)    stage_verify ;;
     all)
         stage_check
         stage_fetch
+        stage_patch
         stage_bootstrap
         stage_rust
-        stage_patch
         stage_build
         stage_package
         stage_verify

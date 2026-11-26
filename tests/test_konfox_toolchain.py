@@ -187,10 +187,16 @@ class KonfoxToolchainTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ff = Path(tmp) / "firefox"
             (ff / "browser/installer/windows/nsis").mkdir(parents=True)
+            (ff / "build/moz.configure").mkdir(parents=True)
             (ff / "mach").write_text("#!/usr/bin/env python3\n", encoding="utf-8")
             (ff / "mfbt").mkdir(parents=True)
             (ff / "dom/webserial").mkdir(parents=True)
 
+            (ff / "build/moz.configure/windows.configure").write_text(
+                '    def win32_subsystem_version():\n'
+                '        return "10.0"\n',
+                encoding="utf-8",
+            )
             (ff / "browser/installer/windows/nsis/defines.nsi.in").write_text(
                 '!define MinSupportedVer "Microsoft Windows 10 x64"\n', encoding="utf-8"
             )
@@ -219,6 +225,10 @@ class KonfoxToolchainTests(unittest.TestCase):
                 "}\n",
                 encoding="utf-8",
             )
+
+            self.assertEqual(len(apply_win7_patches.patch_windows_subsystem(ff, False)), 1)
+            self.assertIn('return "6.01"', (ff / "build/moz.configure/windows.configure").read_text(encoding="utf-8"))
+            self.assertEqual(apply_win7_patches.patch_windows_subsystem(ff, False), [])
 
             self.assertEqual(len(apply_win7_patches.patch_nsis_win7(ff, False)), 2)
             self.assertEqual(len(apply_win7_patches.patch_windows_version_h(ff, False)), 1)

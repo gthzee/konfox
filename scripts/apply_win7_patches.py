@@ -324,6 +324,33 @@ def apply_patch_series(firefox_dir: Path, patches_dir: Path, dry_run: bool) -> l
     return applied
 
 
+def patch_windows_subsystem(firefox_dir: Path, dry_run: bool) -> list[str]:
+    """Lower Windows PE subsystem version from 10.0 to 6.01 (Windows 7 SP1).
+
+    Upstream build/moz.configure/windows.configure hardcodes:
+        def win32_subsystem_version():
+            return "10.0"
+    Windows 7 SP1 rejects executables with PE subsystem >= 10.0 as
+    "not a valid Win32 application". Setting 6.01 enables launching on
+    Windows 7 SP1 and all newer Windows versions.
+    """
+    win_cfg = firefox_dir / "build/moz.configure/windows.configure"
+    if not win_cfg.is_file():
+        return []
+
+    original = win_cfg.read_text(encoding="utf-8")
+    updated = re.sub(
+        r'(def\s+win32_subsystem_version\s*\(\s*\)\s*:\s*\n\s*return\s+)(["\'])10\.0\2',
+        r'\g<1>\g<2>6.01\g<2>',
+        original,
+    )
+    if updated != original:
+        if not dry_run:
+            win_cfg.write_text(updated, encoding="utf-8")
+        return ["build/moz.configure/windows.configure"]
+    return []
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Apply Könfox Windows 7 SP1 x64 patches to a Firefox Nightly checkout."
@@ -343,6 +370,7 @@ def main() -> int:
 
     all_touched: list[str] = []
     for step_name, fn in (
+        ("Windows PE subsystem 6.01 (Win7 SP1)", lambda: patch_windows_subsystem(args.firefox_dir, args.dry_run)),
         ("NSIS Win7 installer gate", lambda: patch_nsis_win7(args.firefox_dir, args.dry_run)),
         ("WindowsVersion.h helpers", lambda: patch_windows_version_h(args.firefox_dir, args.dry_run)),
         ("WebSerial CfgMgr32 dynamic load", lambda: patch_webserial_win7(args.firefox_dir, args.dry_run)),
