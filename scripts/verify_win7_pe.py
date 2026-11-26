@@ -126,6 +126,7 @@ FORBIDDEN_APIS_WIN7: dict[str, dict[str, str]] = {
         "PathCchCombine": "Win8+",
         "PathCchRemoveFileSpec": "Win8+",
         "GetCurrentPackageFullName": "Win8+ AppModel",
+        "QueryUnbiasedInterruptTimePrecise": "Win10+ (fallback: QueryUnbiasedInterruptTime)",
     },
     "user32.dll": {
         "GetDpiForWindow": "Win10 1607+ (must be GetProcAddress)",

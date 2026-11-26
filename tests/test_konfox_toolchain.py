@@ -387,6 +387,13 @@ class KonfoxToolchainTests(unittest.TestCase):
                 ),
                 "mozglue/misc/moz.build": '    OS_LIBS += ["dbghelp", "oleaut32", "ole32", "mincore"]\n',
                 "mozglue/misc/Futex_windows.cpp": "return ::WaitOnAddress(&mValue, &aExpected, 4, 0);\n",
+                "mozglue/misc/AwakeTimeStamp.cpp": (
+                    "AwakeTimeStamp AwakeTimeStamp::Now() {\n"
+                    "  ULONGLONG interrupt_time;\n"
+                    "  QueryUnbiasedInterruptTimePrecise(&interrupt_time);\n\n"
+                    "  return AwakeTimeStamp(interrupt_time / kHNSperUS);\n"
+                    "}\n"
+                ),
                 "third_party/angle/src/common/SimpleMutex.h": (
                     "#    elif defined(ANGLE_PLATFORM_WINDOWS) && !defined(ANGLE_ENABLE_WINDOWS_UWP) && \\\n"
                     "        !defined(ANGLE_WINDOWS_NO_FUTEX)\n"
@@ -456,7 +463,7 @@ class KonfoxToolchainTests(unittest.TestCase):
 
             self.assertEqual(len(apply_win7_patches.patch_winlauncher_and_appmodel(ff, False)), 4)
             self.assertEqual(len(apply_win7_patches.patch_chromium_sandbox_win7(ff, False)), 3)
-            self.assertEqual(len(apply_win7_patches.patch_mozglue_futex_and_mincore(ff, False)), 2)
+            self.assertEqual(len(apply_win7_patches.patch_mozglue_futex_and_mincore(ff, False)), 3)
             self.assertEqual(len(apply_win7_patches.patch_angle_futex(ff, False)), 1)
             self.assertEqual(len(apply_win7_patches.patch_shcore_and_pathcch(ff, False)), 9)
             self.assertEqual(len(apply_win7_patches.patch_cpu_sets_win7(ff, False)), 1)
@@ -468,9 +475,19 @@ class KonfoxToolchainTests(unittest.TestCase):
             self.assertNotIn('"mincore"', (ff / "mozglue/misc/moz.build").read_text(encoding="utf-8"))
             self.assertNotIn('"runtimeobject"', (ff / "browser/app/winlauncher/moz.build").read_text(encoding="utf-8"))
             self.assertIn("SleepConditionVariableSRW", (ff / "mozglue/misc/Futex_windows.cpp").read_text(encoding="utf-8"))
+            awake_out = (ff / "mozglue/misc/AwakeTimeStamp.cpp").read_text(encoding="utf-8")
+            self.assertIn("QueryUnbiasedInterruptTime(&interrupt_time)", awake_out)
+            self.assertIn('"QueryUnbiasedInterruptTimePrecise"', awake_out)
+            self.assertNotIn("  QueryUnbiasedInterruptTimePrecise(&interrupt_time)", awake_out)
+            self.assertIn("pQueryUnbiasedInterruptTimePrecise(&interrupt_time)", awake_out)
             self.assertIn("TLG_HAVE_EVENT_SET_INFORMATION 2", (ff / "tools/profiler/public/ETWTools.h").read_text(encoding="utf-8"))
-            self.assertIn("PathCanonicalizeW", (ff / "widget/windows/WinUtils.cpp").read_text(encoding="utf-8"))
-            self.assertIn("SystemDPI()", (ff / "widget/windows/WinUtils.cpp").read_text(encoding="utf-8"))
+            winutils_out = (ff / "widget/windows/WinUtils.cpp").read_text(encoding="utf-8")
+            self.assertIn('"PathCanonicalizeW"', winutils_out)
+            self.assertNotIn("::PathCanonicalizeW", winutils_out)
+            self.assertIn("SystemDPI()", winutils_out)
+            updatecommon_out = (ff / "toolkit/mozapps/update/common/updatecommon.cpp").read_text(encoding="utf-8")
+            self.assertIn('"PathCanonicalizeW"', updatecommon_out)
+            self.assertNotIn("::PathCanonicalizeW", updatecommon_out)
 
             # All 9 transforms must be idempotent on a second pass
             self.assertEqual(apply_win7_patches.patch_winlauncher_and_appmodel(ff, False), [])

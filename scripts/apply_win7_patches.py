@@ -715,6 +715,39 @@ template struct FutexImpl<uint8_t>;
 """
 
 
+AWAKE_TIMESTAMP_OLD = """\
+AwakeTimeStamp AwakeTimeStamp::Now() {
+  ULONGLONG interrupt_time;
+  QueryUnbiasedInterruptTimePrecise(&interrupt_time);
+
+  return AwakeTimeStamp(interrupt_time / kHNSperUS);
+}"""
+
+AWAKE_TIMESTAMP_NEW = """\
+AwakeTimeStamp AwakeTimeStamp::Now() {
+  // [Könfox Win7] QueryUnbiasedInterruptTimePrecise requires Windows 10+
+  // (mincore / api-ms-win-core-realtime-l1-1-1.dll); resolve dynamically from
+  // kernelbase.dll and fall back to Win7-native QueryUnbiasedInterruptTime.
+  using QueryUnbiasedInterruptTimePreciseFn = VOID(WINAPI*)(PULONGLONG);
+  static const auto pQueryUnbiasedInterruptTimePrecise = []() {
+    HMODULE kb = ::GetModuleHandleW(L"kernelbase.dll");
+    return kb ? reinterpret_cast<QueryUnbiasedInterruptTimePreciseFn>(
+                    reinterpret_cast<void*>(::GetProcAddress(
+                        kb, "QueryUnbiasedInterruptTimePrecise")))
+              : nullptr;
+  }();
+  ULONGLONG interrupt_time = 0;
+  if (pQueryUnbiasedInterruptTimePrecise) {
+    pQueryUnbiasedInterruptTimePrecise(&interrupt_time);
+  } else {
+    DebugOnly<bool> rv = QueryUnbiasedInterruptTime(&interrupt_time);
+    MOZ_ASSERT(rv);
+  }
+
+  return AwakeTimeStamp(interrupt_time / kHNSperUS);
+}"""
+
+
 def patch_mozglue_futex_and_mincore(firefox_dir: Path, dry_run: bool) -> list[str]:
     touched: list[str] = []
 
@@ -728,6 +761,17 @@ def patch_mozglue_futex_and_mincore(firefox_dir: Path, dry_run: bool) -> list[st
             if not dry_run:
                 futex_cpp.write_text(FUTEX_WINDOWS_WIN7, encoding="utf-8")
             touched.append("mozglue/misc/Futex_windows.cpp")
+
+    awake_cpp = firefox_dir / "mozglue/misc/AwakeTimeStamp.cpp"
+    if awake_cpp.is_file():
+        text = awake_cpp.read_text(encoding="utf-8")
+        if "[Könfox Win7]" not in text and AWAKE_TIMESTAMP_OLD in text:
+            if not dry_run:
+                awake_cpp.write_text(
+                    text.replace(AWAKE_TIMESTAMP_OLD, AWAKE_TIMESTAMP_NEW, 1),
+                    encoding="utf-8",
+                )
+            touched.append("mozglue/misc/AwakeTimeStamp.cpp")
 
     return touched
 
@@ -824,7 +868,7 @@ bool WinUtils::CanonicalizePath(nsAString& aPath) {
 bool WinUtils::CanonicalizePath(nsAString& aPath) {
   wchar_t tempPath[MAX_PATH + 1];
   // [Könfox Win7] PathCchCanonicalize (api-ms-win-core-path-l1-1-0.dll)
-  // requires Windows 8+; fall back to shlwapi PathCanonicalizeW on Win7.
+  // requires Windows 8+; fall back to dynamic shlwapi!PathCanonicalizeW.
   using PathCchCanonicalizeFn = HRESULT(WINAPI*)(PWSTR, size_t, PCWSTR);
   static const auto pPathCchCanonicalize = []() -> PathCchCanonicalizeFn {
     HMODULE mod = ::LoadLibraryW(L"api-ms-win-core-path-l1-1-0.dll");
@@ -839,9 +883,20 @@ bool WinUtils::CanonicalizePath(nsAString& aPath) {
     if (FAILED(hr)) {
       return false;
     }
-  } else if (!::PathCanonicalizeW(
-                 tempPath, (char16ptr_t)PromiseFlatString(aPath).get())) {
-    return false;
+  } else {
+    using PathCanonicalizeWFn = BOOL(WINAPI*)(LPWSTR, LPCWSTR);
+    static const auto pPathCanonicalizeW = []() -> PathCanonicalizeWFn {
+      HMODULE mod = ::LoadLibraryW(L"shlwapi.dll");
+      return mod ? reinterpret_cast<PathCanonicalizeWFn>(
+                       reinterpret_cast<void*>(
+                           ::GetProcAddress(mod, "PathCanonicalizeW")))
+                 : nullptr;
+    }();
+    if (!pPathCanonicalizeW ||
+        !pPathCanonicalizeW(tempPath,
+                            (char16ptr_t)PromiseFlatString(aPath).get())) {
+      return false;
+    }
   }"""
         if old_canon in new_text:
             new_text = new_text.replace(old_canon, new_canon, 1)
@@ -857,7 +912,8 @@ bool WinUtils::CanonicalizePath(nsAString& aPath) {
         text = uc.read_text(encoding="utf-8")
         old_uc = "  if (FAILED(PathCchCanonicalize(canonicalPath, MAXPATHLEN, testPath))) {"
         new_uc = """\
-  // [Könfox Win7] PathCchCanonicalize requires Windows 8+.
+  // [Könfox Win7] PathCchCanonicalize requires Windows 8+; fall back to
+  // dynamic shlwapi!PathCanonicalizeW (no <shlwapi.h> or shlwapi.lib needed).
   using PathCchCanonicalizeFn = HRESULT(WINAPI*)(PWSTR, size_t, PCWSTR);
   static const auto pPathCchCanonicalize = []() -> PathCchCanonicalizeFn {
     HMODULE mod = ::LoadLibraryW(L"api-ms-win-core-path-l1-1-0.dll");
@@ -865,10 +921,22 @@ bool WinUtils::CanonicalizePath(nsAString& aPath) {
             reinterpret_cast<void*>(::GetProcAddress(mod, "PathCchCanonicalize")))
                : nullptr;
   }();
-  bool canonOk = pPathCchCanonicalize
-                     ? SUCCEEDED(pPathCchCanonicalize(canonicalPath, MAXPATHLEN,
-                                                      testPath))
-                     : (::PathCanonicalizeW(canonicalPath, testPath) != FALSE);
+  bool canonOk = false;
+  if (pPathCchCanonicalize) {
+    canonOk = SUCCEEDED(
+        pPathCchCanonicalize(canonicalPath, MAXPATHLEN, testPath));
+  } else {
+    using PathCanonicalizeWFn = BOOL(WINAPI*)(LPWSTR, LPCWSTR);
+    static const auto pPathCanonicalizeW = []() -> PathCanonicalizeWFn {
+      HMODULE mod = ::LoadLibraryW(L"shlwapi.dll");
+      return mod ? reinterpret_cast<PathCanonicalizeWFn>(
+                       reinterpret_cast<void*>(
+                           ::GetProcAddress(mod, "PathCanonicalizeW")))
+                 : nullptr;
+    }();
+    canonOk = pPathCanonicalizeW &&
+              pPathCanonicalizeW(canonicalPath, testPath) != FALSE;
+  }
   if (!canonOk) {"""
         if old_uc in text:
             if not dry_run:
@@ -1093,14 +1161,16 @@ def patch_llama_cpp_win7(firefox_dir: Path, dry_run: bool) -> list[str]:
             return false;
         }"""
     new_call = """\
-        // [Könfox Win7] SetThreadInformation requires Windows 8+ (pure C).
-        typedef BOOL(WINAPI* SetThreadInformationFn)(HANDLE, THREAD_INFORMATION_CLASS, LPVOID, DWORD);
-        SetThreadInformationFn pSetThreadInformation =
-            (SetThreadInformationFn)(void*) GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadInformation");
-        if (pSetThreadInformation &&
-            !pSetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &t, sizeof(t))) {
-            GGML_LOG_DEBUG("failed to disable thread power throttling %d : (%d)\\n", prio, (int) GetLastError());
-            return false;
+        {
+            // [Könfox Win7] SetThreadInformation requires Windows 8+ (pure C).
+            typedef BOOL(WINAPI* SetThreadInformationFn)(HANDLE, THREAD_INFORMATION_CLASS, LPVOID, DWORD);
+            SetThreadInformationFn pSetThreadInformation =
+                (SetThreadInformationFn)(void*) GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadInformation");
+            if (pSetThreadInformation &&
+                !pSetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &t, sizeof(t))) {
+                GGML_LOG_DEBUG("failed to disable thread power throttling %d : (%d)\\n", prio, (int) GetLastError());
+                return false;
+            }
         }"""
     if old_call in text:
         if not dry_run:
