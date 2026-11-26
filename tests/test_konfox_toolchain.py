@@ -497,16 +497,35 @@ class KonfoxToolchainTests(unittest.TestCase):
             with zipfile.ZipFile(buf, "w") as zf:
                 zf.writestr("Contents/VC/Tools/MSVC/14.44.35207/include/vector", "// stl\n")
                 zf.writestr("Contents/VC/Tools/MSVC/14.44.35207/include/yvals.h", "// hdr\n")
+                zf.writestr("Contents/VC/Tools/MSVC/14.44.35207/include/vcruntime.h", "// hdr\n")
+                zf.writestr("Contents/VC/Tools/MSVC/14.44.35207/atlmfc/include/atlbase.h", "// atl\n")
+                zf.writestr("Contents/VC/Tools/MSVC/14.44.35207/atlmfc/lib/x64/ATLS.lib", b"LIB")
                 zf.writestr("Contents/VC/Tools/MSVC/14.44.35207/lib/x64/LIBCMT.lib", b"LIB")
                 zf.writestr("Contents/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/cl.exe", b"MZ")
-                zf.writestr("Contents/VC/Redist/MSVC/14.44.35211/x64/Microsoft.VC143.CRT/msvcp140.dll", b"MZ")
+                for dll in install_msvc1444_win7.REQUIRED_REDIST_DLLS:
+                    zf.writestr(
+                        f"Contents/VC/Redist/MSVC/14.44.35211/x64/Microsoft.VC143.CRT/{dll}",
+                        b"MZ",
+                    )
                 zf.writestr("_rels/.rels", "ignored")
 
             extracted = install_msvc1444_win7.extract_vc_vsix(buf.getvalue(), vs)
-            self.assertEqual(extracted, 5)
+            self.assertEqual(extracted, 11)
+            # Missing oldnames.lib / msvcrt.lib (from CRT.x64.Store.base) -> MUST be False!
+            self.assertFalse(install_msvc1444_win7.is_already_msvc1444(vs))
+
+            # Now extract the remaining dynamic CRT libs (simulating CRT.x64.Store.base)
+            buf2 = io.BytesIO()
+            with zipfile.ZipFile(buf2, "w") as zf:
+                for lib in install_msvc1444_win7.REQUIRED_X64_LIBS:
+                    zf.writestr(f"Contents/VC/Tools/MSVC/14.44.35207/lib/x64/{lib.upper()}", b"LIB")
+            install_msvc1444_win7.extract_vc_vsix(buf2.getvalue(), vs)
             self.assertTrue(install_msvc1444_win7.is_already_msvc1444(vs))
+
             # .lib must be lowercased; .exe must be executable
+            self.assertTrue((vs / "VC/Tools/MSVC/14.44.35207/lib/x64/oldnames.lib").is_file())
             self.assertTrue((vs / "VC/Tools/MSVC/14.44.35207/lib/x64/libcmt.lib").is_file())
+            self.assertTrue((vs / "VC/Tools/MSVC/14.44.35207/atlmfc/lib/x64/atls.lib").is_file())
             cl_exe = vs / "VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/cl.exe"
             self.assertTrue(bool(os.stat(cl_exe).st_mode & 0o111))
 

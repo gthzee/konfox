@@ -229,7 +229,7 @@ CFGMGR_SHIM_REGISTER = """\
     using RegisterNotificationFn = CONFIGRET(WINAPI*)(
         PCM_NOTIFY_FILTER, PVOID, PCM_NOTIFY_CALLBACK, PHCMNOTIFICATION);
     if (auto fn = reinterpret_cast<RegisterNotificationFn>(
-            GetProcAddress(cfgmgr, "CM_Register_Notification"))) {
+            reinterpret_cast<void*>(GetProcAddress(cfgmgr, "CM_Register_Notification")))) {
       cr = fn(&filter, this, DeviceNotificationCallback, &mDeviceNotification);
     }
     FreeLibrary(cfgmgr);
@@ -241,7 +241,7 @@ CFGMGR_SHIM_UNREGISTER = """\
     if (HMODULE cfgmgr = LoadLibraryW(L"CfgMgr32.dll")) {
       using UnregisterNotificationFn = CONFIGRET(WINAPI*)(HCMNOTIFICATION);
       if (auto fn = reinterpret_cast<UnregisterNotificationFn>(
-              GetProcAddress(cfgmgr, "CM_Unregister_Notification"))) {
+            reinterpret_cast<void*>(GetProcAddress(cfgmgr, "CM_Unregister_Notification")))) {
         fn(mDeviceNotification);
       }
       FreeLibrary(cfgmgr);
@@ -300,11 +300,11 @@ LAUNCHER_GET_FACTORY_NEW = """\
     HMODULE hRt = ::LoadLibraryW(L"api-ms-win-core-winrt-l1-1-0.dll");
     auto pCreateStrRef =
         hStr ? reinterpret_cast<WindowsCreateStringReferenceFn>(
-                   ::GetProcAddress(hStr, "WindowsCreateStringReference"))
+            reinterpret_cast<void*>(::GetProcAddress(hStr, "WindowsCreateStringReference")))
              : nullptr;
     auto pRoGetFactory =
         hRt ? reinterpret_cast<RoGetActivationFactoryFn>(
-                  ::GetProcAddress(hRt, "RoGetActivationFactory"))
+            reinterpret_cast<void*>(::GetProcAddress(hRt, "RoGetActivationFactory")))
             : nullptr;
     ComPtr<IAppInstanceStatics> appInstanceStatics;
     HRESULT hr = E_NOTIMPL;
@@ -313,7 +313,7 @@ LAUNCHER_GET_FACTORY_NEW = """\
           RuntimeClass_Windows_ApplicationModel_AppInstance;
       HSTRING_HEADER header{};
       HSTRING hClassName = nullptr;
-      hr = pCreateStrRef(kClassName, static_cast<UINT32>(::wcslen(kClassName)),
+      hr = pCreateStrRef(kClassName, static_cast<UINT32>(::lstrlenW(kClassName)),
                          &header, &hClassName);
       if (SUCCEEDED(hr)) {
         hr = pRoGetFactory(
@@ -327,8 +327,9 @@ LAUNCHER_PACKAGE_NEW = """\
   // [Könfox Win7] GetCurrentPackageFullName requires Windows 8+.
   using GetCurrentPackageFullNameFn = LONG(WINAPI*)(UINT32*, PWSTR);
   static const auto pGetCurrentPackageFullName =
-      reinterpret_cast<GetCurrentPackageFullNameFn>(::GetProcAddress(
-          ::GetModuleHandleW(L"kernel32.dll"), "GetCurrentPackageFullName"));
+      reinterpret_cast<GetCurrentPackageFullNameFn>(
+            reinterpret_cast<void*>(::GetProcAddress(
+          ::GetModuleHandleW(L"kernel32.dll"), "GetCurrentPackageFullName")));
   if (!pGetCurrentPackageFullName) {
     return false;
   }
@@ -369,8 +370,9 @@ def patch_winlauncher_and_appmodel(firefox_dir: Path, dry_run: bool) -> list[str
   // [Könfox Win7] GetCurrentPackageFullName requires Windows 8+.
   using GetCurrentPackageFullNameFn = LONG(WINAPI*)(UINT32*, PWSTR);
   static const auto pGetCurrentPackageFullName =
-      reinterpret_cast<GetCurrentPackageFullNameFn>(::GetProcAddress(
-          ::GetModuleHandleW(L"kernel32.dll"), "GetCurrentPackageFullName"));
+      reinterpret_cast<GetCurrentPackageFullNameFn>(
+            reinterpret_cast<void*>(::GetProcAddress(
+          ::GetModuleHandleW(L"kernel32.dll"), "GetCurrentPackageFullName")));
   if (!pGetCurrentPackageFullName) {
     return NS_ERROR_FAILURE;
   }
@@ -397,8 +399,9 @@ def patch_winlauncher_and_appmodel(firefox_dir: Path, dry_run: bool) -> list[str
   // [Könfox Win7] GetCurrentPackageFullName requires Windows 8+.
   using GetCurrentPackageFullNameFn = LONG(WINAPI*)(UINT32*, PWSTR);
   static const auto pGetCurrentPackageFullName =
-      reinterpret_cast<GetCurrentPackageFullNameFn>(::GetProcAddress(
-          ::GetModuleHandleW(L"kernel32.dll"), "GetCurrentPackageFullName"));
+      reinterpret_cast<GetCurrentPackageFullNameFn>(
+            reinterpret_cast<void*>(::GetProcAddress(
+          ::GetModuleHandleW(L"kernel32.dll"), "GetCurrentPackageFullName")));
   UINT32 pfnLen = 0;
   bool inMsix = pGetCurrentPackageFullName &&
                 pGetCurrentPackageFullName(&pfnLen, nullptr) !=
@@ -436,8 +439,8 @@ def patch_chromium_sandbox_win7(firefox_dir: Path, dry_run: bool) -> list[str]:
     // [Könfox Win7] GetProcessMitigationPolicy requires Windows 8+.
     static const auto pGetProcessMitigationPolicy =
         reinterpret_cast<decltype(&::GetProcessMitigationPolicy)>(
-            ::GetProcAddress(::GetModuleHandleW(L"kernel32.dll"),
-                             "GetProcessMitigationPolicy"));
+            reinterpret_cast<void*>(::GetProcAddress(::GetModuleHandleW(L"kernel32.dll"),
+                             "GetProcessMitigationPolicy")));
     if (pGetProcessMitigationPolicy &&
         !pGetProcessMitigationPolicy(::GetCurrentProcess(),
                                      ProcessMitigationOptionsMask,
@@ -456,8 +459,8 @@ def patch_chromium_sandbox_win7(firefox_dir: Path, dry_run: bool) -> list[str]:
   // [Könfox Win7] SetProcessMitigationPolicy requires Windows 8+.
   static const auto pSetProcessMitigationPolicy =
       reinterpret_cast<decltype(&::SetProcessMitigationPolicy)>(
-          ::GetProcAddress(::GetModuleHandleW(L"kernel32.dll"),
-                           "SetProcessMitigationPolicy"));
+            reinterpret_cast<void*>(::GetProcAddress(::GetModuleHandleW(L"kernel32.dll"),
+                           "SetProcessMitigationPolicy")));
   if (!pSetProcessMitigationPolicy) {
     return false;
   }
@@ -481,8 +484,8 @@ def patch_chromium_sandbox_win7(firefox_dir: Path, dry_run: bool) -> list[str]:
     // [Könfox Win7] SetDefaultDllDirectories requires KB2533623 on Win7 or Win8+.
     static const auto pSetDefaultDllDirectories =
         reinterpret_cast<decltype(&::SetDefaultDllDirectories)>(
-            ::GetProcAddress(::GetModuleHandleW(L"kernel32.dll"),
-                             "SetDefaultDllDirectories"));
+            reinterpret_cast<void*>(::GetProcAddress(::GetModuleHandleW(L"kernel32.dll"),
+                             "SetDefaultDllDirectories")));
     if (pSetDefaultDllDirectories) {
       if (!pSetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS)) {
         return false;
@@ -503,8 +506,8 @@ def patch_chromium_sandbox_win7(firefox_dir: Path, dry_run: bool) -> list[str]:
     // [Könfox Win7] SetThreadInformation requires Windows 8+.
     static const auto pSetThreadInformation =
         reinterpret_cast<decltype(&::SetThreadInformation)>(
-            ::GetProcAddress(::GetModuleHandleW(L"kernel32.dll"),
-                             "SetThreadInformation"));
+            reinterpret_cast<void*>(::GetProcAddress(::GetModuleHandleW(L"kernel32.dll"),
+                             "SetThreadInformation")));
     if (!pSetThreadInformation ||
         !pSetThreadInformation(::GetCurrentThread(), ThreadDynamicCodePolicy,
                                &thread_policy, sizeof(thread_policy))) {
@@ -531,8 +534,8 @@ def patch_chromium_sandbox_win7(firefox_dir: Path, dry_run: bool) -> list[str]:
     // [Könfox Win7] GetProcessMitigationPolicy requires Windows 8+.
     static const auto pGetProcessMitigationPolicy =
         reinterpret_cast<decltype(&::GetProcessMitigationPolicy)>(
-            ::GetProcAddress(::GetModuleHandleW(L"kernel32.dll"),
-                             "GetProcessMitigationPolicy"));
+            reinterpret_cast<void*>(::GetProcAddress(::GetModuleHandleW(L"kernel32.dll"),
+                             "GetProcessMitigationPolicy")));
     if (pGetProcessMitigationPolicy &&
         pGetProcessMitigationPolicy(GetCurrentProcess(),
                                     ProcessSystemCallDisablePolicy, &policy,
@@ -554,8 +557,8 @@ def patch_chromium_sandbox_win7(firefox_dir: Path, dry_run: bool) -> list[str]:
   // [Könfox Win7] GetSystemTimePreciseAsFileTime requires Windows 8+.
   static const auto pGetSystemTimePreciseAsFileTime = []() {
     auto fn = reinterpret_cast<decltype(&::GetSystemTimeAsFileTime)>(
-        ::GetProcAddress(::GetModuleHandleW(L"kernel32.dll"),
-                         "GetSystemTimePreciseAsFileTime"));
+            reinterpret_cast<void*>(::GetProcAddress(::GetModuleHandleW(L"kernel32.dll"),
+                         "GetSystemTimePreciseAsFileTime")));
     return fn ? fn : &::GetSystemTimeAsFileTime;
   }();
   pGetSystemTimePreciseAsFileTime(&ft);"""
@@ -599,11 +602,11 @@ static BOOL CALLBACK InitWin8FutexApi(PINIT_ONCE, PVOID, PVOID*) {
   HMODULE mod = ::LoadLibraryW(L"api-ms-win-core-synch-l1-2-0.dll");
   if (mod) {
     auto w = reinterpret_cast<WaitOnAddressFn>(
-        ::GetProcAddress(mod, "WaitOnAddress"));
+            reinterpret_cast<void*>(::GetProcAddress(mod, "WaitOnAddress")));
     auto s = reinterpret_cast<WakeByAddressSingleFn>(
-        ::GetProcAddress(mod, "WakeByAddressSingle"));
+            reinterpret_cast<void*>(::GetProcAddress(mod, "WakeByAddressSingle")));
     auto a = reinterpret_cast<WakeByAddressAllFn>(
-        ::GetProcAddress(mod, "WakeByAddressAll"));
+            reinterpret_cast<void*>(::GetProcAddress(mod, "WakeByAddressAll")));
     if (w && s && a) {
       sWaitOnAddress = w;
       sWakeSingle = s;
@@ -747,8 +750,9 @@ def patch_angle_futex(firefox_dir: Path, dry_run: bool) -> list[str]:
 // Assume support.
 #        define ANGLE_USE_FUTEX 1"""
     new_block = """\
-#    elif 0  // [Könfox Win7] Disable Win8+ WaitOnAddress futex; use ANGLE MutexOnStd fallback.
-#        define ANGLE_USE_FUTEX 1"""
+#    elif defined(ANGLE_PLATFORM_WINDOWS)
+// [Könfox Win7] Disable Win8+ WaitOnAddress futex; use ANGLE MutexOnStd fallback.
+#        define ANGLE_USE_FUTEX 0"""
     if old_block in text:
         if not dry_run:
             p.write_text(text.replace(old_block, new_block, 1), encoding="utf-8")
@@ -793,7 +797,7 @@ float WinUtils::MonitorDPI(HMONITOR aMonitor) {
   static const auto pGetDpiForMonitor = []() -> decltype(&::GetDpiForMonitor) {
     HMODULE mod = ::LoadLibraryW(L"shcore.dll");
     return mod ? reinterpret_cast<decltype(&::GetDpiForMonitor)>(
-                     ::GetProcAddress(mod, "GetDpiForMonitor"))
+            reinterpret_cast<void*>(::GetProcAddress(mod, "GetDpiForMonitor")))
                : nullptr;
   }();
   if (pGetDpiForMonitor) {
@@ -825,7 +829,7 @@ bool WinUtils::CanonicalizePath(nsAString& aPath) {
   static const auto pPathCchCanonicalize = []() -> PathCchCanonicalizeFn {
     HMODULE mod = ::LoadLibraryW(L"api-ms-win-core-path-l1-1-0.dll");
     return mod ? reinterpret_cast<PathCchCanonicalizeFn>(
-                     ::GetProcAddress(mod, "PathCchCanonicalize"))
+            reinterpret_cast<void*>(::GetProcAddress(mod, "PathCchCanonicalize")))
                : nullptr;
   }();
   if (pPathCchCanonicalize) {
@@ -858,7 +862,7 @@ bool WinUtils::CanonicalizePath(nsAString& aPath) {
   static const auto pPathCchCanonicalize = []() -> PathCchCanonicalizeFn {
     HMODULE mod = ::LoadLibraryW(L"api-ms-win-core-path-l1-1-0.dll");
     return mod ? reinterpret_cast<PathCchCanonicalizeFn>(
-                     ::GetProcAddress(mod, "PathCchCanonicalize"))
+            reinterpret_cast<void*>(::GetProcAddress(mod, "PathCchCanonicalize")))
                : nullptr;
   }();
   bool canonOk = pPathCchCanonicalize
@@ -881,7 +885,7 @@ bool WinUtils::CanonicalizePath(nsAString& aPath) {
   static const auto pGetDpiForMonitor = []() -> decltype(&::GetDpiForMonitor) {
     HMODULE mod = ::LoadLibraryW(L"shcore.dll");
     return mod ? reinterpret_cast<decltype(&::GetDpiForMonitor)>(
-                     ::GetProcAddress(mod, "GetDpiForMonitor"))
+            reinterpret_cast<void*>(::GetProcAddress(mod, "GetDpiForMonitor")))
                : nullptr;
   }();
   HRESULT hr = pGetDpiForMonitor
@@ -903,7 +907,7 @@ bool WinUtils::CanonicalizePath(nsAString& aPath) {
       []() -> decltype(&::GetScaleFactorForMonitor) {
     HMODULE mod = ::LoadLibraryW(L"shcore.dll");
     return mod ? reinterpret_cast<decltype(&::GetScaleFactorForMonitor)>(
-                     ::GetProcAddress(mod, "GetScaleFactorForMonitor"))
+            reinterpret_cast<void*>(::GetProcAddress(mod, "GetScaleFactorForMonitor")))
                : nullptr;
   }();
   HRESULT hr = pGetScaleFactorForMonitor
@@ -929,7 +933,7 @@ bool WinUtils::CanonicalizePath(nsAString& aPath) {
       []() -> decltype(&::GetScaleFactorForMonitor) {
     HMODULE mod = ::LoadLibraryW(L"shcore.dll");
     return mod ? reinterpret_cast<decltype(&::GetScaleFactorForMonitor)>(
-                     ::GetProcAddress(mod, "GetScaleFactorForMonitor"))
+            reinterpret_cast<void*>(::GetProcAddress(mod, "GetScaleFactorForMonitor")))
                : nullptr;
   }();
   HRESULT scale_factor_hr =
@@ -947,7 +951,7 @@ bool WinUtils::CanonicalizePath(nsAString& aPath) {
         []() -> decltype(&::GetScaleFactorForMonitor) {
       HMODULE mod = ::LoadLibraryW(L"shcore.dll");
       return mod ? reinterpret_cast<decltype(&::GetScaleFactorForMonitor)>(
-                       ::GetProcAddress(mod, "GetScaleFactorForMonitor"))
+            reinterpret_cast<void*>(::GetProcAddress(mod, "GetScaleFactorForMonitor")))
                  : nullptr;
     }();
     HRESULT hr =
@@ -994,8 +998,8 @@ def patch_cpu_sets_win7(firefox_dir: Path, dry_run: bool) -> list[str]:
   // [Könfox Win7] GetSystemCpuSetInformation requires Windows 10+.
   static const auto pGetSystemCpuSetInformation =
       reinterpret_cast<decltype(&::GetSystemCpuSetInformation)>(
-          ::GetProcAddress(::GetModuleHandleW(L"kernel32.dll"),
-                           "GetSystemCpuSetInformation"));
+            reinterpret_cast<void*>(::GetProcAddress(::GetModuleHandleW(L"kernel32.dll"),
+                           "GetSystemCpuSetInformation")));
   if (!pGetSystemCpuSetInformation) {
     return Nothing();
   }
@@ -1036,8 +1040,8 @@ def patch_precise_time_win7(firefox_dir: Path, dry_run: bool) -> list[str]:
   // [Könfox Win7] GetSystemTimePreciseAsFileTime requires Windows 8+.
   static const auto pGetSystemTimePreciseAsFileTime = []() {
     auto fn = reinterpret_cast<decltype(&::GetSystemTimeAsFileTime)>(
-        ::GetProcAddress(::GetModuleHandleW(L"kernel32.dll"),
-                         "GetSystemTimePreciseAsFileTime"));
+            reinterpret_cast<void*>(::GetProcAddress(::GetModuleHandleW(L"kernel32.dll"),
+                         "GetSystemTimePreciseAsFileTime")));
     return fn ? fn : &::GetSystemTimeAsFileTime;
   }();
   pGetSystemTimePreciseAsFileTime(&ft);"""
@@ -1092,7 +1096,7 @@ def patch_llama_cpp_win7(firefox_dir: Path, dry_run: bool) -> list[str]:
         // [Könfox Win7] SetThreadInformation requires Windows 8+ (pure C).
         typedef BOOL(WINAPI* SetThreadInformationFn)(HANDLE, THREAD_INFORMATION_CLASS, LPVOID, DWORD);
         SetThreadInformationFn pSetThreadInformation =
-            (SetThreadInformationFn) GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadInformation");
+            (SetThreadInformationFn)(void*) GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadInformation");
         if (pSetThreadInformation &&
             !pSetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &t, sizeof(t))) {
             GGML_LOG_DEBUG("failed to disable thread power throttling %d : (%d)\\n", prio, (int) GetLastError());

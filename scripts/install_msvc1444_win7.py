@@ -34,32 +34,96 @@ VS2022_CHANNEL_URL = "https://aka.ms/vs/17/release/channel"
 # Exact VS 2022 17.14 LTSC (MSVC 14.44) packages needed to cross-compile
 # Firefox x86_64-pc-windows-msvc with clang-cl + lld-link and ship Win7-clean
 # MSVC CRT redistributables.
+#
+# NOTE: Microsoft splits Desktop x64/x86 CRT libraries across TWO VSIXs:
+#   - `*.CRT.x64.Desktop.base`: static CRT libs (libcmt.lib, libcpmt.lib, libvcruntime.lib)
+#   - `*.CRT.x64.Store.base`:   dynamic CRT & core linker libs (oldnames.lib, msvcrt.lib,
+#                               msvcprt.lib, vcruntime.lib, delayimp.lib, comsuppw.lib, ...)
+# Both extract into `VC/Tools/MSVC/14.44.*/lib/x64/` and BOTH are mandatory!
 REQUIRED_PACKAGES = (
     "Microsoft.VC.14.44.17.14.CRT.Headers.base",
     "Microsoft.VC.14.44.17.14.CRT.x64.Desktop.base",
+    "Microsoft.VC.14.44.17.14.CRT.x64.Store.base",
     "Microsoft.VC.14.44.17.14.CRT.x86.Desktop.base",
+    "Microsoft.VC.14.44.17.14.CRT.x86.Store.base",
     "Microsoft.VC.14.44.17.14.CRT.Redist.X64.base",
     "Microsoft.VC.14.44.17.14.ATL.Headers.base",
     "Microsoft.VC.14.44.17.14.ATL.X64.base",
     "Microsoft.VC.14.44.17.14.ATL.X86.base",
     "Microsoft.VC.14.44.17.14.Tools.HostX64.TargetX64.base",
+    "Microsoft.VC.14.44.17.14.Tools.HostX64.TargetX86.base",
     "Microsoft.VC.14.44.17.14.ASAN.Headers.base",
+    "Microsoft.VC.14.44.17.14.Props",
+    "Microsoft.VC.14.44.17.14.Props.x64",
+    "Microsoft.VC.14.44.17.14.Props.ATLMFC",
+    "Microsoft.VC.14.44.17.14.Servicing",
+    "Microsoft.VC.14.44.17.14.Servicing.CrtHeaders",
+    "Microsoft.VC.14.44.17.14.Servicing.ATL",
+    "Microsoft.VC.14.44.17.14.Servicing.Compilers",
+)
+
+# Critical x64 libraries that MUST exist under VC/Tools/MSVC/14.44.*/lib/x64/
+REQUIRED_X64_LIBS = (
+    "oldnames.lib",
+    "msvcrt.lib",
+    "msvcprt.lib",
+    "vcruntime.lib",
+    "libcmt.lib",
+    "libcpmt.lib",
+    "libvcruntime.lib",
+    "delayimp.lib",
+    "comsuppw.lib",
+    "concrt.lib",
+    "legacy_stdio_definitions.lib",
+)
+
+REQUIRED_REDIST_DLLS = (
+    "vcruntime140.dll",
+    "vcruntime140_1.dll",
+    "msvcp140.dll",
+    "msvcp140_atomic_wait.dll",
 )
 
 
-def is_already_msvc1444(vs_dir: Path) -> bool:
+def _find_msvc1444_tool_dir(vs_dir: Path) -> Path | None:
     tools_root = vs_dir / "VC" / "Tools" / "MSVC"
+    if not tools_root.is_dir():
+        return None
+    dirs = sorted(p for p in tools_root.iterdir() if p.is_dir())
+    if not dirs or not all(p.name.startswith("14.44.") for p in dirs):
+        return None
+    return dirs[-1]
+
+
+def _find_msvc1444_crt_dir(vs_dir: Path) -> Path | None:
     redist_root = vs_dir / "VC" / "Redist" / "MSVC"
-    if not tools_root.is_dir() or not redist_root.is_dir():
+    if not redist_root.is_dir():
+        return None
+    dirs = sorted(p for p in redist_root.iterdir() if p.is_dir())
+    if not dirs or not all(p.name.startswith("14.44.") for p in dirs):
+        return None
+    crt_dirs = sorted(dirs[-1].glob("x64/Microsoft.VC*CRT"))
+    return crt_dirs[-1] if crt_dirs else None
+
+
+def is_already_msvc1444(vs_dir: Path) -> bool:
+    tool_dir = _find_msvc1444_tool_dir(vs_dir)
+    crt_dir = _find_msvc1444_crt_dir(vs_dir)
+    if not tool_dir or not crt_dir:
         return False
-    tool_vers = [p.name for p in tools_root.iterdir() if p.is_dir()]
-    redist_vers = [p.name for p in redist_root.iterdir() if p.is_dir()]
-    if not tool_vers or not redist_vers:
+
+    lib_x64 = tool_dir / "lib" / "x64"
+    if not all((lib_x64 / lib).is_file() for lib in REQUIRED_X64_LIBS):
         return False
-    return (
-        all(v.startswith("14.44.") for v in tool_vers)
-        and all(v.startswith("14.44.") for v in redist_vers)
-    )
+    if not (tool_dir / "atlmfc" / "lib" / "x64" / "atls.lib").is_file():
+        return False
+    if not (tool_dir / "include" / "vector").is_file():
+        return False
+    if not (tool_dir / "bin" / "Hostx64" / "x64" / "cl.exe").is_file():
+        return False
+    if not all((crt_dir / dll).is_file() for dll in REQUIRED_REDIST_DLLS):
+        return False
+    return True
 
 
 def fetch_json(url: str) -> dict:
@@ -68,7 +132,7 @@ def fetch_json(url: str) -> dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def resolve_package_urls() -> list[tuple[str, str]]:
+def resolve_package_urls() -> list[tuple[str, list[str]]]:
     print(f"[msvc1444] Fetching VS 2022 channel manifest from {VS2022_CHANNEL_URL} ...")
     channel = fetch_json(VS2022_CHANNEL_URL)
     vsman_url = None
@@ -83,14 +147,14 @@ def resolve_package_urls() -> list[tuple[str, str]]:
 
     manifest = fetch_json(vsman_url)
     wanted = {pid.lower(): pid for pid in REQUIRED_PACKAGES}
-    found: dict[str, tuple[str, str]] = {}
+    found: dict[str, tuple[str, list[str]]] = {}
     for pkg in manifest.get("packages", []):
         pid = pkg.get("id", "")
         key = pid.lower()
         if key in wanted:
-            payloads = pkg.get("payloads", [])
-            if payloads:
-                found[key] = (pid, payloads[0]["url"])
+            urls = [pl["url"] for pl in pkg.get("payloads", []) if "url" in pl]
+            if urls:
+                found[key] = (pid, urls)
 
     missing = [orig for low, orig in wanted.items() if low not in found]
     if missing:
@@ -167,17 +231,39 @@ def regenerate_overlay_yaml(vs_dir: Path) -> Path:
     return overlay_path
 
 
-def verify_redist_dlls(vs_dir: Path) -> None:
+def verify_msvc1444_install(vs_dir: Path) -> None:
+    tool_dir = _find_msvc1444_tool_dir(vs_dir)
+    if not tool_dir:
+        raise RuntimeError(f"MSVC 14.44 toolset directory missing under {vs_dir}/VC/Tools/MSVC")
+
+    lib_x64 = tool_dir / "lib" / "x64"
+    missing_libs = [lib for lib in REQUIRED_X64_LIBS if not (lib_x64 / lib).is_file()]
+    if missing_libs:
+        raise RuntimeError(f"Missing critical MSVC 14.44 x64 libraries in {lib_x64}: {missing_libs}")
+
+    for must_exist in (
+        tool_dir / "atlmfc" / "lib" / "x64" / "atls.lib",
+        tool_dir / "include" / "vector",
+        tool_dir / "include" / "vcruntime.h",
+        tool_dir / "atlmfc" / "include" / "atlbase.h",
+        tool_dir / "bin" / "Hostx64" / "x64" / "cl.exe",
+    ):
+        if not must_exist.is_file():
+            raise RuntimeError(f"Expected MSVC 14.44 file missing: {must_exist}")
+
+    cl_exe = tool_dir / "bin" / "Hostx64" / "x64" / "cl.exe"
+    if not (os.stat(cl_exe).st_mode & 0o111):
+        raise RuntimeError(f"cl.exe is not marked executable: {cl_exe}")
+
+    crt_dir = _find_msvc1444_crt_dir(vs_dir)
+    if not crt_dir:
+        raise RuntimeError(f"Could not find 14.44.*/x64/Microsoft.VC*CRT under {vs_dir}")
+
     script_dir = Path(__file__).resolve().parent
     sys.path.insert(0, str(script_dir))
     import verify_win7_pe as vp  # noqa: E402
 
-    redist_matches = sorted((vs_dir / "VC" / "Redist" / "MSVC").glob("14.44.*/x64/Microsoft.VC143.CRT"))
-    if not redist_matches:
-        raise RuntimeError(f"Could not find 14.44.*/x64/Microsoft.VC143.CRT under {vs_dir}")
-    crt_dir = redist_matches[-1]
-    required = ("vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll", "msvcp140_atomic_wait.dll")
-    for dll in required:
+    for dll in REQUIRED_REDIST_DLLS:
         path = crt_dir / dll
         if not path.is_file():
             raise RuntimeError(f"Expected redist DLL missing: {path}")
@@ -187,7 +273,10 @@ def verify_redist_dlls(vs_dir: Path) -> None:
                 f"MSVC 14.44 redist DLL {path} unexpectedly has Win8+ imports:\n  "
                 + "\n  ".join(findings)
             )
-    print(f"[msvc1444] Verified Win7-clean CRT redist DLLs in {crt_dir} (0 findings).")
+    print(
+        f"[msvc1444] Verified complete MSVC 14.44 toolset ({tool_dir.name}, "
+        f"{len(REQUIRED_X64_LIBS)} core x64 libs) & Win7-clean CRT redist ({crt_dir.name}, 0 findings)."
+    )
 
 
 def install_msvc1444(vs_dir: Path, force: bool = False) -> None:
@@ -195,29 +284,27 @@ def install_msvc1444(vs_dir: Path, force: bool = False) -> None:
         raise SystemExit(f"[msvc1444:error] VS sysroot does not exist: {vs_dir}")
 
     if not force and is_already_msvc1444(vs_dir):
-        print(f"[msvc1444] {vs_dir} already uses Win7-compatible MSVC 14.44 — skipping download.")
+        print(f"[msvc1444] {vs_dir} already has complete Win7-compatible MSVC 14.44 — skipping download.")
         return
 
     packages = resolve_package_urls()
     vc_dir = vs_dir / "VC"
-    staging_vc = vs_dir / "VC.msvc1444.staging"
-    if staging_vc.exists():
-        shutil.rmtree(staging_vc)
-    staging_root = staging_vc.parent / "_msvc1444_tmp"
+    staging_root = vs_dir / "_msvc1444_tmp"
     if staging_root.exists():
         shutil.rmtree(staging_root)
     staging_root.mkdir(parents=True)
 
     try:
         total_files = 0
-        for pid, url in packages:
-            print(f"[msvc1444] Downloading {pid} ...")
-            req = urllib.request.Request(url, headers={"User-Agent": "Konfox-Win7-Builder/1.0"})
-            with urllib.request.urlopen(req, timeout=180) as resp:
-                data = resp.read()
-            extracted = extract_vc_vsix(data, staging_root)
-            total_files += extracted
-            print(f"  extracted {extracted} files ({len(data) / 1048576:.1f} MiB)")
+        for pid, urls in packages:
+            for url in urls:
+                print(f"[msvc1444] Downloading {pid} ...")
+                req = urllib.request.Request(url, headers={"User-Agent": "Konfox-Win7-Builder/1.0"})
+                with urllib.request.urlopen(req, timeout=180) as resp:
+                    data = resp.read()
+                extracted = extract_vc_vsix(data, staging_root)
+                total_files += extracted
+                print(f"  extracted {extracted} files ({len(data) / 1048576:.1f} MiB)")
 
         if not (staging_root / "VC" / "Tools" / "MSVC").is_dir():
             raise RuntimeError("Staging extraction did not produce VC/Tools/MSVC")
@@ -231,7 +318,7 @@ def install_msvc1444(vs_dir: Path, force: bool = False) -> None:
 
     overlay_path = regenerate_overlay_yaml(vs_dir)
     print(f"[msvc1444] Installed MSVC 14.44 ({total_files} files) and rebuilt {overlay_path}")
-    verify_redist_dlls(vs_dir)
+    verify_msvc1444_install(vs_dir)
 
 
 def main() -> int:
