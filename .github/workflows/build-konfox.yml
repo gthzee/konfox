@@ -225,20 +225,31 @@ jobs:
 
       - name: Add 8 GB swapfile safety net for xul.dll linking
         run: |
-          sudo fallocate -l 8G /swapfile
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
+          SWAP_PATH="/swapfile"
+          MNT_AVAIL_GB=$(df -BG --output=avail /mnt 2>/dev/null | tail -n1 | tr -dc '0-9' || echo 0)
+          if [ "${MNT_AVAIL_GB:-0}" -ge 10 ]; then
+            SWAP_PATH="/mnt/swapfile"
+          fi
+          echo "Creating 8 GB swapfile at ${SWAP_PATH}..."
+          sudo fallocate -l 8G "$SWAP_PATH"
+          sudo chmod 600 "$SWAP_PATH"
+          sudo mkswap "$SWAP_PATH"
+          sudo swapon "$SWAP_PATH"
           free -h
-          df -h /
+          df -h / /mnt 2>/dev/null || df -h /
 
-      - name: Install Linux->Windows cross-compile & NSIS packaging packages
+      - name: Install Linux->Windows cross-compile, 32-bit Wine runtime & NSIS packages
         run: |
           sudo apt-get update
+          # Matches Mozilla taskcluster/docker/debian-build/Dockerfile for Wine/midl.exe + NSIS
           sudo apt-get install -y \
-            git python3 python3-pip curl msitools cmake ninja-build \
-            nsis p7zip-full zip xz-utils zstd build-essential pkg-config \
-            librsvg2-bin imagemagick
+            git python3 python3-pip python3-dev curl msitools cmake ninja-build \
+            nsis p7zip-full zip unzip xz-utils zstd bzip2 cpio rsync \
+            build-essential pkg-config librsvg2-bin imagemagick \
+            libc6-i386 lib32gcc-s1 lib32stdc++6 lib32atomic1 lib32z1 \
+            libxml2 uuid-runtime
+          # Verify 32-bit ELF loader required by Mozilla's bootstrapped Wine (midl.exe)
+          ls -la /lib/ld-linux.so.2
 
       - name: Restore Win7-patched Rust stdlib from cache
         uses: actions/cache@v4
