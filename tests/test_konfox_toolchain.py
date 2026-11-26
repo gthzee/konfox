@@ -25,6 +25,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import apply_branding
 import apply_win7_patches
+import install_msvc1444_win7
 import patch_rust_win7
 import verify_win7_pe
 
@@ -308,6 +309,213 @@ class KonfoxToolchainTests(unittest.TestCase):
             self.assertIn("api-ms-win-core-synch-l1-2-0.dll", joined)
             self.assertIn("GetTempPath2W", joined)
             self.assertIn("CM_Register_Notification", joined)
+
+            # Verify expanded Win8+ API-set allowlist & newly added Win8+ APIs
+            pathcch_dll = Path(tmp) / "widget_broken.dll"
+            pathcch_dll.write_bytes(
+                build_synthetic_pe64(
+                    [
+                        ("api-ms-win-core-path-l1-1-0.dll", ["PathCchCanonicalize"]),
+                        ("api-ms-win-core-memory-l1-1-5.dll", ["VirtualAlloc2"]),
+                        ("KERNEL32.dll", ["GetCurrentPackageFullName", "CopyFile2"]),
+                        ("api-ms-win-crt-runtime-l1-1-0.dll", ["_initterm"]),
+                        ("api-ms-win-core-synch-l1-1-0.dll", ["Sleep"]),
+                    ]
+                )
+            )
+            findings2 = verify_win7_pe.audit_pe_file(pathcch_dll)
+            self.assertEqual(len(findings2), 4, f"Unexpected findings: {findings2}")
+            joined2 = "\n".join(findings2)
+            self.assertIn("api-ms-win-core-path-l1-1-0.dll", joined2)
+            self.assertIn("api-ms-win-core-memory-l1-1-5.dll", joined2)
+            self.assertIn("GetCurrentPackageFullName", joined2)
+            self.assertIn("CopyFile2", joined2)
+
+    def test_win7_all_new_pe_import_patches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ff = Path(tmp) / "firefox"
+            files = {
+                "browser/app/winlauncher/moz.build": (
+                    'OS_LIBS += [\n    "ole32",\n    "runtimeobject",\n    "shlwapi",\n]\n'
+                ),
+                "browser/app/winlauncher/LauncherProcessWin.cpp": (
+                    "    ComPtr<IAppInstanceStatics> appInstanceStatics;\n"
+                    "    HRESULT hr = GetActivationFactory(\n"
+                    "        HStringReference(RuntimeClass_Windows_ApplicationModel_AppInstance)\n"
+                    "            .Get(),\n"
+                    "        appInstanceStatics.GetAddressOf());\n"
+                    "  LONG rc = GetCurrentPackageFullName(&length, NULL);\n"
+                ),
+                "browser/components/shell/WindowsUserChoice.cpp": (
+                    "  UINT32 pfnLen = 0;\n"
+                    "  LONG rv = GetCurrentPackageFullName(&pfnLen, nullptr);\n"
+                    "  NS_ENSURE_TRUE(rv != APPMODEL_ERROR_NO_PACKAGE, NS_ERROR_FAILURE);\n\n"
+                    "  auto pfn = std::make_unique<wchar_t[]>(pfnLen);\n"
+                    "  rv = GetCurrentPackageFullName(&pfnLen, pfn.get());\n"
+                ),
+                "toolkit/mozapps/defaultagent/SetDefaultBrowser.cpp": (
+                    "  UINT32 pfnLen = 0;\n"
+                    "  bool inMsix =\n"
+                    "      GetCurrentPackageFullName(&pfnLen, nullptr) != APPMODEL_ERROR_NO_PACKAGE;\n"
+                ),
+                "security/sandbox/chromium/sandbox/win/src/process_mitigations.cc": (
+                    "    if (!::GetProcessMitigationPolicy(::GetCurrentProcess(),\n"
+                    "                                      ProcessMitigationOptionsMask,\n"
+                    "                                      &mitigations, mits_size)) {\n"
+                    "      NOTREACHED();\n"
+                    "    }\n"
+                    "  PCHECK(::SetProcessMitigationPolicy(policy, lpBuffer, dwLength))\n"
+                    '      << "SetProcessMitigationPolicy failed with Policy: " << policy;\n'
+                    "  if (flags & MITIGATION_DLL_SEARCH_ORDER) {\n"
+                    "    if (!::SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS)) {\n"
+                    "      return false;\n"
+                    "    }\n\n"
+                    "    applied_flags |= MITIGATION_DLL_SEARCH_ORDER;\n"
+                    "  }\n"
+                    "    if (!::SetThreadInformation(::GetCurrentThread(), ThreadDynamicCodePolicy,\n"
+                    "                                &thread_policy, sizeof(thread_policy))) {\n"
+                    "      return false;\n"
+                    "    }\n"
+                ),
+                "security/sandbox/chromium/base/win/win_util.cc": (
+                    "    if (::GetProcessMitigationPolicy(GetCurrentProcess(),\n"
+                    "                                     ProcessSystemCallDisablePolicy, &policy,\n"
+                    "                                     sizeof(policy))) {\n"
+                ),
+                "security/sandbox/chromium/base/time/time_win.cc": (
+                    "  ::GetSystemTimePreciseAsFileTime(&ft);\n"
+                ),
+                "mozglue/misc/moz.build": '    OS_LIBS += ["dbghelp", "oleaut32", "ole32", "mincore"]\n',
+                "mozglue/misc/Futex_windows.cpp": "return ::WaitOnAddress(&mValue, &aExpected, 4, 0);\n",
+                "third_party/angle/src/common/SimpleMutex.h": (
+                    "#    elif defined(ANGLE_PLATFORM_WINDOWS) && !defined(ANGLE_ENABLE_WINDOWS_UWP) && \\\n"
+                    "        !defined(ANGLE_WINDOWS_NO_FUTEX)\n"
+                    "// Windows has futexes since version 8, which is already end of life (let alone older versions).\n"
+                    "// Assume support.\n"
+                    "#        define ANGLE_USE_FUTEX 1\n"
+                ),
+                "widget/windows/moz.build": 'OS_LIBS += [\n    "pathcch",\n    "shcore",\n    "winmm",\n]\n',
+                "widget/windows/WinUtils.cpp": (
+                    "float WinUtils::MonitorDPI(HMONITOR aMonitor) {\n"
+                    "  UINT dpiX, dpiY = 96;\n"
+                    "  GetDpiForMonitor(aMonitor ? aMonitor : GetPrimaryMonitor(), MDT_EFFECTIVE_DPI,\n"
+                    "                   &dpiX, &dpiY);\n"
+                    "  return dpiY;\n"
+                    "}\n"
+                    "bool WinUtils::CanonicalizePath(nsAString& aPath) {\n"
+                    "  wchar_t tempPath[MAX_PATH + 1];\n"
+                    "  HRESULT hr = PathCchCanonicalize(tempPath, std::size(tempPath),\n"
+                    "                                   (char16ptr_t)PromiseFlatString(aPath).get());\n"
+                    "  if (FAILED(hr)) {\n"
+                    "    return false;\n"
+                    "  }\n"
+                ),
+                "toolkit/mozapps/update/common/moz.build": '    OS_LIBS += [\n        "pathcch",\n        "shell32",\n    ]\n',
+                "toolkit/mozapps/update/common/updatecommon.cpp": (
+                    "  if (FAILED(PathCchCanonicalize(canonicalPath, MAXPATHLEN, testPath))) {\n"
+                ),
+                "third_party/libwebrtc/modules/desktop_capture/desktop_capture_gn/moz.build": '    "shcore",\n',
+                "third_party/libwebrtc/webrtc_gn/moz.build": '    "shcore",\n',
+                "third_party/libwebrtc/modules/desktop_capture/win/screen_capture_utils.cc": (
+                    "  HRESULT hr = ::GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &dpi_x, &dpi_y);\n"
+                ),
+                "third_party/libwebrtc/modules/desktop_capture/win/dxgi_output_duplicator.cc": (
+                    "  HRESULT hr = GetScaleFactorForMonitor(monitor_, &device_scale_factor);\n"
+                ),
+                "third_party/libwebrtc/modules/desktop_capture/win/wgc_capture_session.cc": (
+                    "  HRESULT scale_factor_hr =\n"
+                    "      GetScaleFactorForMonitor(monitor_.value(), &device_scale_factor);\n"
+                    "    HRESULT hr =\n"
+                    "        GetScaleFactorForMonitor(monitor_.value(), &device_scale_factor);\n"
+                ),
+                "hal/windows/WindowsHeterogeneousCpuInfo.cpp": (
+                    "  ULONG returnedLength;\n"
+                    "  GetSystemCpuSetInformation(NULL, 0, &returnedLength, NULL, 0);\n\n"
+                    "  if (!returnedLength) {\n"
+                    "    return Nothing();\n"
+                    "  }\n\n"
+                    "  AutoTArray<uint8_t, 1024> cpuSets;\n\n"
+                    "  cpuSets.SetLength(returnedLength);\n\n"
+                    "  if (!GetSystemCpuSetInformation(\n"
+                    "          reinterpret_cast<SYSTEM_CPU_SET_INFORMATION*>(cpuSets.Elements()),\n"
+                    "          returnedLength, &returnedLength, NULL, 0)) {\n"
+                ),
+                "js/src/vm/Time.cpp": "  GetSystemTimePreciseAsFileTime(&ft);\n",
+                "tools/profiler/public/ETWTools.h": "#  include <TraceLoggingProvider.h>\n",
+                "third_party/llama.cpp/ggml/src/ggml-cpu/ggml-cpu-c.c": (
+                    "        if (!SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &t, sizeof(t))) {\n"
+                    '            GGML_LOG_DEBUG("failed to disable thread power throttling %d : (%d)\\n", prio, (int) GetLastError());\n'
+                    "            return false;\n"
+                    "        }\n"
+                ),
+            }
+            for rel, content in files.items():
+                p = ff / rel
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(content, encoding="utf-8")
+
+            self.assertEqual(len(apply_win7_patches.patch_winlauncher_and_appmodel(ff, False)), 4)
+            self.assertEqual(len(apply_win7_patches.patch_chromium_sandbox_win7(ff, False)), 3)
+            self.assertEqual(len(apply_win7_patches.patch_mozglue_futex_and_mincore(ff, False)), 2)
+            self.assertEqual(len(apply_win7_patches.patch_angle_futex(ff, False)), 1)
+            self.assertEqual(len(apply_win7_patches.patch_shcore_and_pathcch(ff, False)), 9)
+            self.assertEqual(len(apply_win7_patches.patch_cpu_sets_win7(ff, False)), 1)
+            self.assertEqual(len(apply_win7_patches.patch_precise_time_win7(ff, False)), 1)
+            self.assertEqual(len(apply_win7_patches.patch_etw_tracelogging_win7(ff, False)), 1)
+            self.assertEqual(len(apply_win7_patches.patch_llama_cpp_win7(ff, False)), 1)
+
+            # Spot-check critical outputs
+            self.assertNotIn('"mincore"', (ff / "mozglue/misc/moz.build").read_text(encoding="utf-8"))
+            self.assertNotIn('"runtimeobject"', (ff / "browser/app/winlauncher/moz.build").read_text(encoding="utf-8"))
+            self.assertIn("SleepConditionVariableSRW", (ff / "mozglue/misc/Futex_windows.cpp").read_text(encoding="utf-8"))
+            self.assertIn("TLG_HAVE_EVENT_SET_INFORMATION 2", (ff / "tools/profiler/public/ETWTools.h").read_text(encoding="utf-8"))
+            self.assertIn("PathCanonicalizeW", (ff / "widget/windows/WinUtils.cpp").read_text(encoding="utf-8"))
+            self.assertIn("SystemDPI()", (ff / "widget/windows/WinUtils.cpp").read_text(encoding="utf-8"))
+
+            # All 9 transforms must be idempotent on a second pass
+            self.assertEqual(apply_win7_patches.patch_winlauncher_and_appmodel(ff, False), [])
+            self.assertEqual(apply_win7_patches.patch_chromium_sandbox_win7(ff, False), [])
+            self.assertEqual(apply_win7_patches.patch_mozglue_futex_and_mincore(ff, False), [])
+            self.assertEqual(apply_win7_patches.patch_angle_futex(ff, False), [])
+            self.assertEqual(apply_win7_patches.patch_shcore_and_pathcch(ff, False), [])
+            self.assertEqual(apply_win7_patches.patch_cpu_sets_win7(ff, False), [])
+            self.assertEqual(apply_win7_patches.patch_precise_time_win7(ff, False), [])
+            self.assertEqual(apply_win7_patches.patch_etw_tracelogging_win7(ff, False), [])
+            self.assertEqual(apply_win7_patches.patch_llama_cpp_win7(ff, False), [])
+
+    def test_msvc1444_vsix_extraction_and_overlay(self) -> None:
+        import io
+        import os
+        import zipfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            vs = Path(tmp) / "vs"
+            (vs / "Windows Kits/10/Include/10.0.28000.0/um").mkdir(parents=True)
+            (vs / "Windows Kits/10/Include/10.0.28000.0/um/Windows.h").write_text("// sdk\n", encoding="utf-8")
+
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w") as zf:
+                zf.writestr("Contents/VC/Tools/MSVC/14.44.35207/include/vector", "// stl\n")
+                zf.writestr("Contents/VC/Tools/MSVC/14.44.35207/include/yvals.h", "// hdr\n")
+                zf.writestr("Contents/VC/Tools/MSVC/14.44.35207/lib/x64/LIBCMT.lib", b"LIB")
+                zf.writestr("Contents/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/cl.exe", b"MZ")
+                zf.writestr("Contents/VC/Redist/MSVC/14.44.35211/x64/Microsoft.VC143.CRT/msvcp140.dll", b"MZ")
+                zf.writestr("_rels/.rels", "ignored")
+
+            extracted = install_msvc1444_win7.extract_vc_vsix(buf.getvalue(), vs)
+            self.assertEqual(extracted, 5)
+            self.assertTrue(install_msvc1444_win7.is_already_msvc1444(vs))
+            # .lib must be lowercased; .exe must be executable
+            self.assertTrue((vs / "VC/Tools/MSVC/14.44.35207/lib/x64/libcmt.lib").is_file())
+            cl_exe = vs / "VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/cl.exe"
+            self.assertTrue(bool(os.stat(cl_exe).st_mode & 0o111))
+
+            overlay_path = install_msvc1444_win7.regenerate_overlay_yaml(vs)
+            overlay = json.loads(overlay_path.read_text(encoding="utf-8"))
+            self.assertFalse(overlay["case-sensitive"])
+            root_names = {r["name"] for r in overlay["roots"]}
+            self.assertIn("VC/Tools/MSVC/14.44.35207/include", root_names)
+            self.assertIn("Windows Kits/10/Include/10.0.28000.0/um", root_names)
 
 
 if __name__ == "__main__":

@@ -22,9 +22,11 @@ from pathlib import Path
 
 # DLLs that do NOT exist on Windows 7 SP1 x64 (static import = instant startup crash)
 FORBIDDEN_DLLS_WIN7: dict[str, str] = {
+    "api-ms-win-core-path-l1-1-0.dll": "Win8+ (PathCch* — use dynamic load / shlwapi PathCanonicalizeW)",
     "api-ms-win-core-synch-l1-2-0.dll": "Win8+ (WaitOnAddress / WakeByAddress*)",
     "api-ms-win-core-winrt-l1-1-0.dll": "Win8+ WinRT runtime",
     "api-ms-win-core-winrt-string-l1-1-0.dll": "Win8+ WinRT HSTRING",
+    "api-ms-win-core-winrt-error-l1-1-0.dll": "Win8+ WinRT error",
     "api-ms-win-shcore-scaling-l1-1-1.dll": "Win8.1+ per-monitor DPI scaling",
     "bcryptprimitives.dll": "ProcessPrng export is Win10+ only",
     "dcomp.dll": "Win8+ DirectComposition (must be delay-loaded/dynamic)",
@@ -34,6 +36,39 @@ FORBIDDEN_DLLS_WIN7: dict[str, str] = {
     "windows.storage.dll": "Win10+ Storage",
     "icu.dll": "Win10 1903+ system ICU",
     "microsoft.ui.windowing.dll": "Win11+ Windows App SDK",
+}
+
+# Exact api-ms-win-* DLLs guaranteed present on Windows 7 SP1 + bundled UCRT redist.
+# Any OTHER api-ms-win-* static import is flagged as Win8+/10+ incompatible.
+ALLOWED_API_MS_WIN7_EXACT: set[str] = {
+    "api-ms-win-core-console-l1-1-0.dll",
+    "api-ms-win-core-console-l1-2-0.dll",
+    "api-ms-win-core-datetime-l1-1-0.dll",
+    "api-ms-win-core-debug-l1-1-0.dll",
+    "api-ms-win-core-errorhandling-l1-1-0.dll",
+    "api-ms-win-core-fibers-l1-1-0.dll",
+    "api-ms-win-core-file-l1-1-0.dll",
+    "api-ms-win-core-file-l1-2-0.dll",
+    "api-ms-win-core-file-l2-1-0.dll",
+    "api-ms-win-core-handle-l1-1-0.dll",
+    "api-ms-win-core-heap-l1-1-0.dll",
+    "api-ms-win-core-interlocked-l1-1-0.dll",
+    "api-ms-win-core-libraryloader-l1-1-0.dll",
+    "api-ms-win-core-localization-l1-2-0.dll",
+    "api-ms-win-core-memory-l1-1-0.dll",
+    "api-ms-win-core-namedpipe-l1-1-0.dll",
+    "api-ms-win-core-processenvironment-l1-1-0.dll",
+    "api-ms-win-core-processthreads-l1-1-0.dll",
+    "api-ms-win-core-processthreads-l1-1-1.dll",
+    "api-ms-win-core-profile-l1-1-0.dll",
+    "api-ms-win-core-rtlsupport-l1-1-0.dll",
+    "api-ms-win-core-string-l1-1-0.dll",
+    "api-ms-win-core-synch-l1-1-0.dll",
+    "api-ms-win-core-sysinfo-l1-1-0.dll",
+    "api-ms-win-core-timezone-l1-1-0.dll",
+    "api-ms-win-core-util-l1-1-0.dll",
+    "api-ms-win-core-xstate-l2-1-0.dll",
+    "api-ms-win-eventing-provider-l1-1-0.dll",
 }
 
 # Specific Win8/Win8.1/Win10/Win11-only functions inside DLLs that DO exist on Win7
@@ -53,17 +88,27 @@ FORBIDDEN_APIS_WIN7: dict[str, dict[str, str]] = {
         "VirtualAlloc2": "Win10 1803+ (must be GetProcAddress)",
         "VirtualAllocFromApp": "Win8+ (must be GetProcAddress)",
         "MapViewOfFile3": "Win10 1803+ (must be GetProcAddress)",
-        "WaitOnAddress": "Win8+ (use Rust win7 compat / NtKeyedEvent)",
-        "WakeByAddressSingle": "Win8+ (use Rust win7 compat / NtKeyedEvent)",
-        "WakeByAddressAll": "Win8+ (use Rust win7 compat / NtKeyedEvent)",
+        "UnmapViewOfFile2": "Win10 1803+ (must be GetProcAddress)",
+        "WaitOnAddress": "Win8+ (use dynamic load / SRWLOCK+CV fallback)",
+        "WakeByAddressSingle": "Win8+ (use dynamic load / SRWLOCK+CV fallback)",
+        "WakeByAddressAll": "Win8+ (use dynamic load / SRWLOCK+CV fallback)",
         "GetCurrentThreadStackLimits": "Win8+ (must be GetProcAddress)",
         "SetDefaultDllDirectories": "Win7 only with KB2533623 (prefer GetProcAddress)",
         "AddDllDirectory": "Win7 only with KB2533623 (prefer GetProcAddress)",
         "CreateFile2": "Win8+ (fallback: CreateFileW)",
+        "CopyFile2": "Win8+ (fallback: CopyFileExW)",
         "GetSystemCpuSetInformation": "Win10+ (must be GetProcAddress)",
         "SetThreadSelectedCpuSets": "Win10+ (must be GetProcAddress)",
+        "GetThreadInformation": "Win8+ (must be GetProcAddress)",
         "SetThreadInformation": "Win8+ (must be GetProcAddress)",
+        "GetProcessInformation": "Win8+ (must be GetProcAddress)",
         "SetProcessInformation": "Win8+ (must be GetProcAddress)",
+        "GetCurrentPackageFullName": "Win8+ AppModel (must be GetProcAddress)",
+        "GetCurrentPackageFamilyName": "Win8+ AppModel (must be GetProcAddress)",
+        "GetCurrentPackageId": "Win8+ AppModel (must be GetProcAddress)",
+        "GetPackageFullName": "Win8+ AppModel (must be GetProcAddress)",
+        "AppPolicyGetProcessTerminationMethod": "Win10+ (must be GetProcAddress)",
+        "CreatePseudoConsole": "Win10 1809+ (must be GetProcAddress)",
         "CompareObjectHandles": "Win10+ (must be GetProcAddress)",
         "QueryUnbiasedInterruptTimePrecise": "Win10+ (fallback: QueryUnbiasedInterruptTime)",
     },
@@ -73,9 +118,14 @@ FORBIDDEN_APIS_WIN7: dict[str, dict[str, str]] = {
         "WakeByAddressAll": "Win8+",
         "VirtualAlloc2": "Win10 1803+",
         "MapViewOfFile3": "Win10 1803+",
+        "UnmapViewOfFile2": "Win10 1803+",
         "SetThreadDescription": "Win10 1607+",
         "GetTempPath2W": "Win10 20348+",
+        "PathCchCanonicalize": "Win8+",
         "PathCchCanonicalizeEx": "Win8+",
+        "PathCchCombine": "Win8+",
+        "PathCchRemoveFileSpec": "Win8+",
+        "GetCurrentPackageFullName": "Win8+ AppModel",
     },
     "user32.dll": {
         "GetDpiForWindow": "Win10 1607+ (must be GetProcAddress)",
@@ -98,26 +148,10 @@ FORBIDDEN_APIS_WIN7: dict[str, dict[str, str]] = {
     "advapi32.dll": {
         "EventSetInformation": "Win8+ (must be GetProcAddress)",
     },
-    "ntdll.dll": {
-        "RtlGetVersion": "OK on Win7 (allowed)",  # explicitly NOT forbidden; removed below
-    },
     "dxgi.dll": {
         "CreateDXGIFactory2": "Win8.1+ (must be GetProcAddress)",
     },
-    "dwmapi.dll": {
-        "DwmGetWindowAttribute": "OK on Win7 (allowed)",
-    },
 }
-
-# Remove informational-only "OK" markers so FORBIDDEN_APIS_WIN7 only contains actual violations
-for _dll in list(FORBIDDEN_APIS_WIN7):
-    FORBIDDEN_APIS_WIN7[_dll] = {
-        fn: reason
-        for fn, reason in FORBIDDEN_APIS_WIN7[_dll].items()
-        if not reason.startswith("OK ")
-    }
-    if not FORBIDDEN_APIS_WIN7[_dll]:
-        del FORBIDDEN_APIS_WIN7[_dll]
 
 
 @dataclass
@@ -144,7 +178,9 @@ def read_cstr(data: bytes, offset: int) -> str:
     return data[offset:end].decode("ascii", errors="replace")
 
 
-def parse_pe_imports(pe_path: Path, include_delayload: bool = False) -> tuple[list[tuple[str, list[str]]], list[tuple[str, list[str]]]]:
+def parse_pe_imports(
+    pe_path: Path, include_delayload: bool = False
+) -> tuple[list[tuple[str, list[str]]], list[tuple[str, list[str]]]]:
     """
     Pure-Python PE32 / PE32+ static and delay-load import parser.
     Returns (static_imports, delay_imports) as lists of (dll_name, [func_names...]).
@@ -230,7 +266,6 @@ def parse_pe_imports(pe_path: Path, include_delayload: bool = False) -> tuple[li
                 )
                 if attrs == 0 and name_rva == 0 and int_rva == 0:
                     break
-                # Only RVA-based delay descriptors (attrs & 1)
                 if attrs & 1:
                     name_off = rva_to_offset(name_rva, sections)
                     dll_name = read_cstr(data, name_off) if name_off is not None else "<unknown>"
@@ -256,6 +291,14 @@ def audit_pe_file(pe_path: Path, include_delayload: bool = False) -> list[str]:
             elif dll_lower.startswith("ext-ms-win-"):
                 findings.append(
                     f"[{kind}] {pe_path.name}: imports Win8+/10+ ext-ms API set `{dll}` -> {funcs[:5]}"
+                )
+            elif (
+                dll_lower.startswith("api-ms-win-")
+                and not dll_lower.startswith("api-ms-win-crt-")
+                and dll_lower not in ALLOWED_API_MS_WIN7_EXACT
+            ):
+                findings.append(
+                    f"[{kind}] {pe_path.name}: imports non-Win7 API set `{dll}` -> {funcs[:5]}"
                 )
 
             bad_map = FORBIDDEN_APIS_WIN7.get(dll_lower, {})
@@ -297,17 +340,32 @@ def main() -> int:
         print(f"[verify-win7] No .exe or .dll files found under {args.target}", file=sys.stderr)
         return 2
 
-    # Optional Win10/11-only Microsoft Windows App SDK DLLs bundled by Firefox 163+
-    # (never loaded on Windows 7; skip so they don't produce false positives)
-    OPTIONAL_WIN10_BUNDLED_PREFIXES = ("microsoft.",)
-    OPTIONAL_WIN10_BUNDLED_EXACT = {"coremessagingxp.dll", "marshal.dll"}
+    # Optional Win10/11-only DLLs & UCRT forwarder stubs bundled alongside Firefox:
+    #   * Windows App SDK (microsoft.*.dll, coremessagingxp.dll, marshal.dll)
+    #   * Win10+ out-of-process COM servers never registered or loaded on Win7
+    #     (msixcomserver.dll for MSIX packaging, notificationserver.dll for Win10 Toast Action Center)
+    #   * Microsoft UCRT API-set forwarder stubs (api-ms-win-*.dll, ucrtbase.dll)
+    OPTIONAL_WIN10_BUNDLED_PREFIXES = ("microsoft.", "api-ms-win-")
+    OPTIONAL_WIN10_BUNDLED_EXACT = {
+        "coremessagingxp.dll",
+        "marshal.dll",
+        "msixcomserver.dll",
+        "notificationserver.dll",
+        "ucrtbase.dll",
+    }
 
     all_findings: list[str] = []
     scanned = 0
     for pe in pe_files:
         name_lower = pe.name.lower()
-        if name_lower in OPTIONAL_WIN10_BUNDLED_EXACT or name_lower.startswith(OPTIONAL_WIN10_BUNDLED_PREFIXES):
-            print(f"[verify-win7] skipping optional Win10+ AppSDK DLL: {pe.name}")
+        if (
+            args.target.is_dir()
+            and (
+                name_lower in OPTIONAL_WIN10_BUNDLED_EXACT
+                or name_lower.startswith(OPTIONAL_WIN10_BUNDLED_PREFIXES)
+            )
+        ):
+            print(f"[verify-win7] skipping optional Win10+/UCRT-stub DLL: {pe.name}")
             continue
         try:
             findings = audit_pe_file(pe, include_delayload=args.include_delayload)

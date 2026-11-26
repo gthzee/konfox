@@ -27,6 +27,8 @@ ac_add_options --disable-crashreporter
 ac_add_options --disable-updater
 ac_add_options --disable-maintenance-service
 ac_add_options --disable-default-browser-agent
+# Skip prebuilt Win10-only onnxruntime.dll (Firefox falls back to WASM on Win7)
+ac_add_options --without-onnx-runtime
 export MOZ_LTO=cross
 ac_add_options --enable-js-shell
 

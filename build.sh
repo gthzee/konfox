@@ -145,6 +145,11 @@ stage_bootstrap() {
         --no-system-changes || warn "mach bootstrap reported non-fatal warning; continuing to configure..."
     popd >/dev/null
 
+    if [[ -d "${MOZBUILD_DIR}/vs" ]]; then
+        log "Ensuring Windows 7-compatible MSVC 14.44 toolset & CRT redist in ${MOZBUILD_DIR}/vs..."
+        python3 "${ROOT_DIR}/scripts/install_msvc1444_win7.py" "${MOZBUILD_DIR}/vs"
+    fi
+
     if [[ "$LOW_DISK" -eq 1 ]]; then
         log "Pruning cached .tar.zst archives in ${MOZBUILD_DIR}/toolchains to save disk space..."
         rm -rf "${MOZBUILD_DIR}/toolchains" "${MOZBUILD_DIR}/clang-tools"
@@ -283,6 +288,11 @@ export_build_env() {
 }
 
 stage_build() {
+    if [[ -d "${MOZBUILD_DIR}/vs" ]]; then
+        log "Ensuring Windows 7-compatible MSVC 14.44 toolset & CRT redist in ${MOZBUILD_DIR}/vs..."
+        python3 "${ROOT_DIR}/scripts/install_msvc1444_win7.py" "${MOZBUILD_DIR}/vs"
+    fi
+
     export_build_env
     log "Configuring & cross-compiling Könfox Nightly (${PROFILE}) for Windows 7 SP1 x64..."
     pushd "$FIREFOX_DIR" >/dev/null
@@ -292,13 +302,15 @@ stage_build() {
     ./mach configure
 
     # If --enable-bootstrap just downloaded ~/.mozbuild/vs on first configure,
-    # pick up UCRT redist DLLs and re-run fast configure so UCRT gets packaged.
+    # swap VS 2026's Win10+-only MSVC 14.5x for Win7-clean MSVC 14.44 (VS 2022
+    # 17.14 LTSC), pick up UCRT redist DLLs, and re-run fast configure.
     if [[ "$had_vs" -eq 0 && -d "${MOZBUILD_DIR}/vs" ]]; then
+        log "Swapping bootstrapped VS 2026 MSVC 14.5x -> Win7-compatible MSVC 14.44..."
+        python3 "${ROOT_DIR}/scripts/install_msvc1444_win7.py" "${MOZBUILD_DIR}/vs"
         export_build_env
-        if [[ -n "${KONFOX_UCRT_REDIST_DIR:-}" ]]; then
-            log "Re-configuring with bundled UCRT redist dir..."
-            ./mach configure
-        fi
+        log "Re-configuring cleanly with MSVC 14.44 & bundled UCRT redist dir..."
+        rm -rf "${OBJDIR}"
+        ./mach configure
     fi
 
     if [[ "$LOW_DISK" -eq 1 ]]; then
