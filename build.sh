@@ -313,12 +313,25 @@ stage_package() {
     export_build_env
     log "Packaging Könfox Nightly (.zip + Windows .installer.exe)..."
     pushd "$FIREFOX_DIR" >/dev/null
+    # On WINNT with MOZ_PKG_FORMAT=ZIP, `./mach package` builds BOTH:
+    #   1) dist/konfox-*.en-US.win64.zip
+    #   2) dist/install/sea/konfox-*.en-US.win64.installer.exe (via browser/installer/windows)
+    # Note: Do NOT call `installers-en-US` (that is an l10n repack target that rejects self-overwrite).
     ./mach package
-    ./mach build installers-en-US
     popd >/dev/null
 
+    if ! find "${OBJDIR}/dist" -maxdepth 4 -name "*.installer.exe" | grep -q .; then
+        warn "No .installer.exe found after ./mach package; invoking browser/installer/windows directly..."
+        local zip_in
+        zip_in=$(find "${OBJDIR}/dist" -maxdepth 2 -name "*.en-US.win64.zip" | head -n1 || true)
+        [[ -n "$zip_in" ]] || die "Could not find built .en-US.win64.zip under ${OBJDIR}/dist"
+        make -C "${OBJDIR}/browser/installer/windows" ZIP_IN="${zip_in}" installer
+    fi
+
     mkdir -p "$OUT_DIR"
-    find "${OBJDIR}/dist" -maxdepth 3 \( -name "*.zip" -o -name "*.installer.exe" \) -exec cp -v {} "$OUT_DIR/" \;
+    find "${OBJDIR}/dist" -maxdepth 4 \
+        \( -name "*.en-US.win64.zip" -o -name "*.installer.exe" \) \
+        -exec cp -v {} "$OUT_DIR/" \;
     (cd "$OUT_DIR" && sha256sum *.zip *.exe 2>/dev/null > SHA256SUMS.txt || true)
     log "Packaged artifacts copied to: ${OUT_DIR}"
     ls -lh "$OUT_DIR"
