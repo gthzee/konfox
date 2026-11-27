@@ -580,9 +580,15 @@ FUTEX_WINDOWS_WIN7 = """\
 
 // [Könfox Win7] Dynamic WaitOnAddress/WakeByAddress* on Windows 8+ with a
 // deadlock-free 256-bucket SRWLOCK + CONDITION_VARIABLE fallback on Windows 7.
+// IMPORTANT: Never call LoadLibraryW or InitOnceExecuteOnce here! FutexImpl
+// backs jemalloc arena locks and mozilla::Mutex/CondVar, so touching the
+// Windows loader lock causes AB-BA deadlocks with DLL delay-loading,
+// FreeLibrary shutdown, and post-lockdown sandboxes. kernelbase.dll is always
+// mapped before main() and directly exports WaitOnAddress on Windows 8+.
 
 #include "mozilla/Futex.h"
 
+#include <atomic>
 #include <windows.h>
 
 namespace mozilla {
@@ -593,31 +599,35 @@ using WaitOnAddressFn = BOOL(WINAPI*)(volatile VOID*, PVOID, SIZE_T, DWORD);
 using WakeByAddressSingleFn = VOID(WINAPI*)(PVOID);
 using WakeByAddressAllFn = VOID(WINAPI*)(PVOID);
 
-static INIT_ONCE sFutexApiOnce = INIT_ONCE_STATIC_INIT;
-static WaitOnAddressFn sWaitOnAddress = nullptr;
-static WakeByAddressSingleFn sWakeSingle = nullptr;
-static WakeByAddressAllFn sWakeAll = nullptr;
+// 0 = uninitialized, 1 = Win7 SRWLOCK/CV fallback, 2 = Win8+ WaitOnAddress
+static std::atomic<int> sFutexApiState{0};
+static std::atomic<WaitOnAddressFn> sWaitOnAddress{nullptr};
+static std::atomic<WakeByAddressSingleFn> sWakeSingle{nullptr};
+static std::atomic<WakeByAddressAllFn> sWakeAll{nullptr};
 
-static BOOL CALLBACK InitWin8FutexApi(PINIT_ONCE, PVOID, PVOID*) {
-  HMODULE mod = ::LoadLibraryW(L"api-ms-win-core-synch-l1-2-0.dll");
+static inline int EnsureFutexApiInit() {
+  int state = sFutexApiState.load(std::memory_order_acquire);
+  if (state != 0) {
+    return state;
+  }
+  HMODULE mod = ::GetModuleHandleW(L"kernelbase.dll");
   if (mod) {
     auto w = reinterpret_cast<WaitOnAddressFn>(
-            reinterpret_cast<void*>(::GetProcAddress(mod, "WaitOnAddress")));
+        reinterpret_cast<void*>(::GetProcAddress(mod, "WaitOnAddress")));
     auto s = reinterpret_cast<WakeByAddressSingleFn>(
-            reinterpret_cast<void*>(::GetProcAddress(mod, "WakeByAddressSingle")));
+        reinterpret_cast<void*>(::GetProcAddress(mod, "WakeByAddressSingle")));
     auto a = reinterpret_cast<WakeByAddressAllFn>(
-            reinterpret_cast<void*>(::GetProcAddress(mod, "WakeByAddressAll")));
+        reinterpret_cast<void*>(::GetProcAddress(mod, "WakeByAddressAll")));
     if (w && s && a) {
-      sWaitOnAddress = w;
-      sWakeSingle = s;
-      sWakeAll = a;
+      sWaitOnAddress.store(w, std::memory_order_relaxed);
+      sWakeSingle.store(s, std::memory_order_relaxed);
+      sWakeAll.store(a, std::memory_order_relaxed);
+      sFutexApiState.store(2, std::memory_order_release);
+      return 2;
     }
   }
-  return TRUE;
-}
-
-static inline void EnsureFutexApiInit() {
-  ::InitOnceExecuteOnce(&sFutexApiOnce, InitWin8FutexApi, nullptr, nullptr);
+  sFutexApiState.store(1, std::memory_order_release);
+  return 1;
 }
 
 constexpr size_t kNumFutexBuckets = 256;
@@ -662,11 +672,11 @@ static DWORD ConvertTimeout(const TimeDuration* aTimeout) {
 
 template <typename T>
 bool FutexImpl<T>::wait(T aExpected, const TimeDuration* aTimeout) {
-  EnsureFutexApiInit();
   DWORD timeout = ConvertTimeout(aTimeout);
-  if (sWaitOnAddress) {
-    return sWaitOnAddress(reinterpret_cast<volatile void*>(&mValue),
-                          &aExpected, sizeof(aExpected), timeout) != FALSE;
+  if (EnsureFutexApiInit() == 2) {
+    return sWaitOnAddress.load(std::memory_order_relaxed)(
+               reinterpret_cast<volatile void*>(&mValue), &aExpected,
+               sizeof(aExpected), timeout) != FALSE;
   }
   FutexBucket& bucket = BucketFor(&mValue);
   ::AcquireSRWLockExclusive(&bucket.lock);
@@ -682,9 +692,9 @@ bool FutexImpl<T>::wait(T aExpected, const TimeDuration* aTimeout) {
 
 template <typename T>
 void FutexImpl<T>::wake() {
-  EnsureFutexApiInit();
-  if (sWakeSingle) {
-    sWakeSingle(reinterpret_cast<void*>(&mValue));
+  if (EnsureFutexApiInit() == 2) {
+    sWakeSingle.load(std::memory_order_relaxed)(
+        reinterpret_cast<void*>(&mValue));
     return;
   }
   // Wake all waiters on the hash bucket so hash collisions never starve a
@@ -697,9 +707,9 @@ void FutexImpl<T>::wake() {
 
 template <typename T>
 void FutexImpl<T>::wakeAll() {
-  EnsureFutexApiInit();
-  if (sWakeAll) {
-    sWakeAll(reinterpret_cast<void*>(&mValue));
+  if (EnsureFutexApiInit() == 2) {
+    sWakeAll.load(std::memory_order_relaxed)(
+        reinterpret_cast<void*>(&mValue));
     return;
   }
   FutexBucket& bucket = BucketFor(&mValue);
@@ -2109,6 +2119,76 @@ def patch_chromium_sandbox_runtime_win7(firefox_dir: Path, dry_run: bool) -> lis
                     ),
                     1,
                 )
+        if "[Könfox Win7 mitigation apis]" not in patched:
+            old_get_supp = (
+                "    if (!::GetProcessMitigationPolicy(::GetCurrentProcess(),\n"
+                "                                      ProcessMitigationOptionsMask,\n"
+                "                                      &mitigations, mits_size)) {\n"
+                "      NOTREACHED();\n"
+                "    }"
+            )
+            new_get_supp = (
+                "    // [Könfox Win7 mitigation apis] Dynamically resolve Win8+ GetProcessMitigationPolicy.\n"
+                "    using GetMitigationFn = decltype(&::GetProcessMitigationPolicy);\n"
+                "    static auto sGetMitigation = reinterpret_cast<GetMitigationFn>(\n"
+                "        reinterpret_cast<void*>(::GetProcAddress(\n"
+                '            ::GetModuleHandleW(L"kernel32.dll"), "GetProcessMitigationPolicy")));\n'
+                "    if (sGetMitigation && base::win::GetVersion() >= base::win::Version::WIN8) {\n"
+                "      if (!sGetMitigation(::GetCurrentProcess(), ProcessMitigationOptionsMask,\n"
+                "                          &mitigations, mits_size)) {\n"
+                "        mitigations[0] = 0;\n"
+                "        mitigations[1] = 0;\n"
+                "      }\n"
+                "    }"
+            )
+            old_set_mit = (
+                "bool SetProcessMitigationPolicyInternal(PROCESS_MITIGATION_POLICY policy,\n"
+                "                                        PVOID lpBuffer,\n"
+                "                                        SIZE_T dwLength) {\n"
+                "  PCHECK(::SetProcessMitigationPolicy(policy, lpBuffer, dwLength))\n"
+                '      << "SetProcessMitigationPolicy failed with Policy: " << policy;\n\n'
+                "  return true;\n"
+                "}"
+            )
+            new_set_mit = (
+                "bool SetProcessMitigationPolicyInternal(PROCESS_MITIGATION_POLICY policy,\n"
+                "                                        PVOID lpBuffer,\n"
+                "                                        SIZE_T dwLength) {\n"
+                "  if (base::win::GetVersion() < base::win::Version::WIN8) {\n"
+                "    return true;\n"
+                "  }\n"
+                "  using SetMitigationFn = decltype(&::SetProcessMitigationPolicy);\n"
+                "  static auto sSetMitigation = reinterpret_cast<SetMitigationFn>(\n"
+                "      reinterpret_cast<void*>(::GetProcAddress(\n"
+                '          ::GetModuleHandleW(L"kernel32.dll"), "SetProcessMitigationPolicy")));\n'
+                "  if (!sSetMitigation) {\n"
+                "    return true;\n"
+                "  }\n"
+                "  PCHECK(sSetMitigation(policy, lpBuffer, dwLength))\n"
+                '      << "SetProcessMitigationPolicy failed with Policy: " << policy;\n\n'
+                "  return true;\n"
+                "}"
+            )
+            old_filter = (
+                "MitigationFlags FilterPostStartupProcessMitigations(MitigationFlags flags) {\n"
+                "  return flags & (MITIGATION_BOTTOM_UP_ASLR | MITIGATION_DLL_SEARCH_ORDER);\n"
+                "}"
+            )
+            new_filter = (
+                "MitigationFlags FilterPostStartupProcessMitigations(MitigationFlags flags) {\n"
+                "  if (base::win::GetVersion() < base::win::Version::WIN8) {\n"
+                "    return flags & (MITIGATION_HEAP_TERMINATE | MITIGATION_BOTTOM_UP_ASLR |\n"
+                "                    MITIGATION_DLL_SEARCH_ORDER);\n"
+                "  }\n"
+                "  return flags & (MITIGATION_BOTTOM_UP_ASLR | MITIGATION_DLL_SEARCH_ORDER);\n"
+                "}"
+            )
+            if old_get_supp in patched:
+                patched = patched.replace(old_get_supp, new_get_supp, 1)
+            if old_set_mit in patched:
+                patched = patched.replace(old_set_mit, new_set_mit, 1)
+            if old_filter in patched:
+                patched = patched.replace(old_filter, new_filter, 1)
         if patched != orig:
             if not dry_run:
                 pm_cc.write_text(patched, encoding="utf-8")
@@ -2168,6 +2248,7 @@ def patch_chromium_sandbox_runtime_win7(firefox_dir: Path, dry_run: bool) -> lis
             )
             new_finish = (
                 "  ConfigBase* config_base = static_cast<ConfigBase*>(policy_base->GetConfig());\n\n"
+                "  bool assigned_to_job = true;\n"
                 "  if (base::win::GetVersion() < base::win::Version::WIN10) {\n"
                 "    HANDLE job_handle = policy_base->GetJobHandle();\n"
                 "    if (job_handle &&\n"
@@ -2175,19 +2256,33 @@ def patch_chromium_sandbox_runtime_win7(firefox_dir: Path, dry_run: bool) -> lis
                 "      DWORD err = ::GetLastError();\n"
                 "      // On Win7, nested jobs are unsupported if the parent is already in a\n"
                 "      // non-breakaway job (ERROR_ACCESS_DENIED); allow launch to continue.\n"
-                "      if (err != ERROR_ACCESS_DENIED) {\n"
+                "      if (err == ERROR_ACCESS_DENIED) {\n"
+                "        assigned_to_job = false;\n"
+                "      } else {\n"
                 "        *last_error = err;\n"
                 "        target->Terminate();\n"
                 "        return SBOX_ERROR_CANNOT_INIT_JOB;\n"
                 "      }\n"
                 "    }\n"
                 "  }\n\n"
-                "  if (config_base->GetJobLevel() <= JobLevel::kLimitedUser) {"
+                "  if (assigned_to_job && config_base->GetJobLevel() <= JobLevel::kLimitedUser) {"
+            )
+            old_assoc = (
+                "  // There is no obvious cleanup here.\n"
+                "  CHECK(AssociateCompletionPort(job_handle, job_port_.get(), tracker));"
+            )
+            new_assoc = (
+                "  // There is no obvious cleanup here.\n"
+                "  if (assigned_to_job) {\n"
+                "    CHECK(AssociateCompletionPort(job_handle, job_port_.get(), tracker));\n"
+                "  }"
             )
             if old_job_attr in patched and old_finish in patched:
                 patched = patched.replace(old_job_attr, new_job_attr, 1).replace(
                     old_finish, new_finish, 1
                 )
+                if old_assoc in patched:
+                    patched = patched.replace(old_assoc, new_assoc, 1)
         if patched != orig:
             if not dry_run:
                 bs_cc.write_text(patched, encoding="utf-8")
@@ -2427,7 +2522,12 @@ def patch_graphics_win7(firefox_dir: Path, dry_run: bool) -> list[str]:
     - gfx/config/gfxConfigManager.cpp: disable WebRender DirectComposition on
       < Windows 10 (dcomp.dll does not exist on Windows 7 SP1).
     - gfx/thebes/DeviceManagerDx.cpp: only request D3D_FEATURE_LEVEL_11_1 on
-      Windows 8+ (Win7 SP1 without Platform Update rejects 11_1).
+      Windows 8+, and skip DoesTextureSharingWork() on WARP < Windows 8.
+    - gfx/thebes/gfxPlatform.cpp: guard D3D11 double buffering and WMF
+      zero-copy NV12 textures behind IsWin10OrLater().
+    - gfx/thebes/d3dkmtQueryStatistics.h & gfxWindowsPlatform.cpp: use the
+      Windows 7 struct layout for D3DKMTQS_SEGMENT_INFO / ProcessSegmentInfo
+      on < Windows 8 so GPU memory reporting does not read corrupt fields.
     """
     touched: list[str] = []
 
@@ -2483,10 +2583,156 @@ def patch_graphics_win7(firefox_dir: Path, dry_run: bool) -> list[str]:
                 ),
                 1,
             )
+        if "[Könfox Win7 warp]" not in patched:
+            old_warp = (
+                '                    "FEATURE_FAILURE_D3D11_WARP_DEVICE2"_ns);\n'
+                "    return;\n"
+                "  }\n\n"
+                "  bool textureSharingWorks = D3D11Checks::DoesTextureSharingWork(device);"
+            )
+            new_warp = (
+                '                    "FEATURE_FAILURE_D3D11_WARP_DEVICE2"_ns);\n'
+                "    return;\n"
+                "  }\n\n"
+                "  // [Könfox Win7 warp] DoesTextureSharingWork corrupts WARP D3D11 on Win7.\n"
+                "  bool textureSharingWorks =\n"
+                "      mozilla::IsWin8OrLater() && D3D11Checks::DoesTextureSharingWork(device);"
+            )
+            if old_warp in patched:
+                patched = patched.replace(old_warp, new_warp, 1)
         if patched != orig:
             if not dry_run:
                 dm_cpp.write_text(patched, encoding="utf-8")
             touched.append(str(dm_cpp.relative_to(firefox_dir)))
+
+    gp_cpp = firefox_dir / "gfx/thebes/gfxPlatform.cpp"
+    if gp_cpp.is_file():
+        orig = gp_cpp.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        if "[Könfox Win7]" not in patched:
+            old_db = (
+                "    if (StaticPrefs::gfx_direct3d11_use_double_buffering()) {\n"
+                "      gfxVars::SetUseDoubleBufferingWithCompositor(true);\n"
+                "    }"
+            )
+            new_db = (
+                "    // [Könfox Win7] Double buffering with compositor requires Windows 10+.\n"
+                "    if (IsWin10OrLater() && StaticPrefs::gfx_direct3d11_use_double_buffering()) {\n"
+                "      gfxVars::SetUseDoubleBufferingWithCompositor(true);\n"
+                "    }"
+            )
+            old_zc = "  if (StaticPrefs::media_wmf_zero_copy_nv12_textures_AtStartup()) {"
+            new_zc = (
+                "  if (\n"
+                "#ifdef XP_WIN\n"
+                "      IsWin10OrLater() &&\n"
+                "#endif\n"
+                "      StaticPrefs::media_wmf_zero_copy_nv12_textures_AtStartup()) {"
+            )
+            if old_db in patched:
+                patched = patched.replace(old_db, new_db, 1)
+            if old_zc in patched:
+                patched = patched.replace(old_zc, new_zc, 1)
+        if patched != orig:
+            if not dry_run:
+                gp_cpp.write_text(patched, encoding="utf-8")
+            touched.append(str(gp_cpp.relative_to(firefox_dir)))
+
+    d3d_h = firefox_dir / "gfx/thebes/d3dkmtQueryStatistics.h"
+    if d3d_h.is_file():
+        orig = d3d_h.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        if "[Könfox Win7]" not in patched:
+            old_seg = (
+                "typedef struct _D3DKMTQS_SEGMENT_INFO {\n"
+                "  ULONGLONG Filler[3];\n"
+                "  struct {\n"
+                "    ULONGLONG Filler;\n"
+                "    ULONG Filler2[2];\n"
+                "  } Filler_M;\n\n"
+                "  ULONG Aperture;\n\n"
+                "  ULONGLONG Filler3[5];\n"
+                "  ULONG64 Filler4[8];\n"
+                "} D3DKMTQS_SEGMENT_INFO;"
+            )
+            new_seg = (
+                "// [Könfox Win7] Win7 uses ULONG fields for D3DKMTQS_SEGMENT_INFO.\n"
+                "typedef struct _D3DKMTQS_SEGMENT_INFO_WIN7 {\n"
+                "  ULONG Filler[3];\n"
+                "  struct {\n"
+                "    ULONGLONG Filler;\n"
+                "    ULONG Filler2[2];\n"
+                "  } Filler_M;\n"
+                "  ULONG Aperture;\n"
+                "  ULONGLONG Filler3[5];\n"
+                "  ULONG64 Filler4[8];\n"
+                "} D3DKMTQS_SEGMENT_INFO_WIN7;\n\n"
+                "typedef struct _D3DKMTQS_SEGMENT_INFO {\n"
+                "  ULONGLONG Filler[3];\n"
+                "  struct {\n"
+                "    ULONGLONG Filler;\n"
+                "    ULONG Filler2[2];\n"
+                "  } Filler_M;\n\n"
+                "  ULONG Aperture;\n\n"
+                "  ULONGLONG Filler3[5];\n"
+                "  ULONG64 Filler4[8];\n"
+                "} D3DKMTQS_SEGMENT_INFO;"
+            )
+            old_pseg = (
+                "typedef struct _D3DKMTQS_PROCESS_SEGMENT_INFO {\n"
+                "  ULONGLONG BytesCommitted;"
+            )
+            new_pseg = (
+                "typedef struct _D3DKMTQS_PROCESS_SEGMENT_INFO {\n"
+                "  union {\n"
+                "    ULONGLONG BytesCommitted;\n"
+                "    ULONG BytesCommittedWin7;\n"
+                "  };"
+            )
+            old_res = "  D3DKMTQS_SEGMENT_INFO SegmentInfo;"
+            new_res = (
+                "  D3DKMTQS_SEGMENT_INFO SegmentInfo;\n"
+                "  D3DKMTQS_SEGMENT_INFO_WIN7 SegmentInfoWin7;"
+            )
+            if old_seg in patched and old_pseg in patched and old_res in patched:
+                patched = (
+                    patched.replace(old_seg, new_seg, 1)
+                    .replace(old_pseg, new_pseg, 1)
+                    .replace(old_res, new_res, 1)
+                )
+        if patched != orig:
+            if not dry_run:
+                d3d_h.write_text(patched, encoding="utf-8")
+            touched.append(str(d3d_h.relative_to(firefox_dir)))
+
+    gwp_cpp = firefox_dir / "gfx/thebes/gfxWindowsPlatform.cpp"
+    if gwp_cpp.is_file():
+        orig = gwp_cpp.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        if "[Könfox Win7]" not in patched:
+            old_ap = "            bool aperture = queryStatistics.QueryResult.SegmentInfo.Aperture;"
+            new_ap = (
+                "            // [Könfox Win7] Read Win7 struct layout on < Windows 8.\n"
+                "            bool aperture = mozilla::IsWin8OrLater()\n"
+                "                                ? queryStatistics.QueryResult.SegmentInfo.Aperture\n"
+                "                                : queryStatistics.QueryResult.SegmentInfoWin7.Aperture;"
+            )
+            old_bc = (
+                "              ULONGLONG bytesCommitted =\n"
+                "                  queryStatistics.QueryResult.ProcessSegmentInfo.BytesCommitted;"
+            )
+            new_bc = (
+                "              ULONGLONG bytesCommitted =\n"
+                "                  mozilla::IsWin8OrLater()\n"
+                "                      ? queryStatistics.QueryResult.ProcessSegmentInfo.BytesCommitted\n"
+                "                      : queryStatistics.QueryResult.ProcessSegmentInfo.BytesCommittedWin7;"
+            )
+            if old_ap in patched and old_bc in patched:
+                patched = patched.replace(old_ap, new_ap, 1).replace(old_bc, new_bc, 1)
+        if patched != orig:
+            if not dry_run:
+                gwp_cpp.write_text(patched, encoding="utf-8")
+            touched.append(str(gwp_cpp.relative_to(firefox_dir)))
 
     return touched
 
@@ -2832,6 +3078,275 @@ def patch_winrt_and_widget_win7(firefox_dir: Path, dry_run: bool) -> list[str]:
                 geo_cpp.write_text(patched, encoding="utf-8")
             touched.append(str(geo_cpp.relative_to(firefox_dir)))
 
+    # --- 23k. intl/locale/windows/OSPreferences_win.cpp ---
+    # Calls RoGetActivationFactory(HStringReference(...)) unguarded on startup,
+    # triggering an SEH 0xC06D007E delay-load crash on Windows 7 SP1.
+    osp_cpp = firefox_dir / "intl/locale/windows/OSPreferences_win.cpp"
+    if osp_cpp.is_file():
+        orig = osp_cpp.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        if "[Könfox Win7]" not in patched:
+            if '#include "mozilla/WindowsVersion.h"' not in patched:
+                patched = patched.replace(
+                    '#include "OSPreferences.h"',
+                    '#include "OSPreferences.h"\n#include "mozilla/WindowsVersion.h"',
+                    1,
+                )
+            old_ro = (
+                "  if (SUCCEEDED(RoGetActivationFactory(\n"
+                "          HStringReference(\n"
+                "              RuntimeClass_Windows_System_UserProfile_GlobalizationPreferences)\n"
+                "              .Get(),"
+            )
+            new_ro = (
+                "  // [Könfox Win7] WinRT GlobalizationPreferences requires Windows 8+;\n"
+                "  // calling RoGetActivationFactory/HStringReference delay-loads WinRT DLLs.\n"
+                "  if (mozilla::IsWin8OrLater() &&\n"
+                "      SUCCEEDED(RoGetActivationFactory(\n"
+                "          HStringReference(\n"
+                "              RuntimeClass_Windows_System_UserProfile_GlobalizationPreferences)\n"
+                "              .Get(),"
+            )
+            if old_ro in patched:
+                patched = patched.replace(old_ro, new_ro, 1)
+        if patched != orig:
+            if not dry_run:
+                osp_cpp.write_text(patched, encoding="utf-8")
+            touched.append(str(osp_cpp.relative_to(firefox_dir)))
+
+    # --- 23l. browser/components/shell/nsWindowsShellService.cpp ---
+    # Guard MSIX/WinRT StartupTask and Package3 activation factories on < Win10.
+    wss_cpp = firefox_dir / "browser/components/shell/nsWindowsShellService.cpp"
+    if wss_cpp.is_file():
+        orig = wss_cpp.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        if "[Könfox Win7]" not in patched:
+            for fn_hdr in (
+                "static void EnableLaunchOnLoginMSIXImpl(\n"
+                "    const nsString& capturedTaskId,\n"
+                "    const RefPtr<nsMainThreadPtrHolder<dom::Promise>> promiseHolder) {\n",
+                "static void DisableLaunchOnLoginMSIXImpl(\n"
+                "    const nsString& capturedTaskId,\n"
+                "    const RefPtr<nsMainThreadPtrHolder<dom::Promise>> promiseHolder) {\n",
+                "static void GetLaunchOnLoginEnabledMSIXImpl(\n"
+                "    const nsString& capturedTaskId,\n"
+                "    const RefPtr<nsMainThreadPtrHolder<dom::Promise>> promiseHolder) {\n",
+            ):
+                if fn_hdr in patched:
+                    patched = patched.replace(
+                        fn_hdr,
+                        (
+                            fn_hdr
+                            + "  // [Könfox Win7] WinRT StartupTask requires Windows 10+.\n"
+                            + "  if (!mozilla::IsWin10OrLater()) {\n"
+                            + "    REJECT_AND_RETURN(promiseHolder, NS_ERROR_NOT_IMPLEMENTED, /* void */);\n"
+                            + "  }\n"
+                        ),
+                        1,
+                    )
+            old_pkg3 = "static HRESULT GetPackage3(ComPtr<IPackage3>& package3) {\n"
+            if old_pkg3 in patched:
+                patched = patched.replace(
+                    old_pkg3,
+                    (
+                        old_pkg3
+                        + "  // [Könfox Win7] WinRT Package API requires Windows 10+.\n"
+                        + "  if (!mozilla::IsWin10OrLater()) {\n"
+                        + "    return E_NOTIMPL;\n"
+                        + "  }\n"
+                    ),
+                    1,
+                )
+        if patched != orig:
+            if not dry_run:
+                wss_cpp.write_text(patched, encoding="utf-8")
+            touched.append(str(wss_cpp.relative_to(firefox_dir)))
+
+    # --- 23m. dom/geolocation/GeolocationSystemWin.cpp ---
+    gsw_cpp = firefox_dir / "dom/geolocation/GeolocationSystemWin.cpp"
+    if gsw_cpp.is_file():
+        orig = gsw_cpp.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        if "[Könfox Win7]" not in patched:
+            if '#include "mozilla/WindowsVersion.h"' not in patched:
+                patched = patched.replace(
+                    '#include "GeolocationSystem.h"',
+                    '#include "GeolocationSystem.h"\n#include "mozilla/WindowsVersion.h"',
+                    1,
+                )
+            old_caf = (
+                "ComPtr<TypeToCreate> CreateFromActivationFactory(const wchar_t* aNamespace) {\n"
+                "  ComPtr<TypeToCreate> newObject;\n"
+            )
+            new_caf = (
+                "ComPtr<TypeToCreate> CreateFromActivationFactory(const wchar_t* aNamespace) {\n"
+                "  ComPtr<TypeToCreate> newObject;\n"
+                "  // [Könfox Win7] WinRT AppCapability/Launcher requires Windows 10+.\n"
+                "  if (!mozilla::IsWin10OrLater()) {\n"
+                "    return newObject;\n"
+                "  }\n"
+            )
+            if old_caf in patched:
+                patched = patched.replace(old_caf, new_caf, 1)
+        if patched != orig:
+            if not dry_run:
+                gsw_cpp.write_text(patched, encoding="utf-8")
+            touched.append(str(gsw_cpp.relative_to(firefox_dir)))
+
+    # --- 23n. dom/system/windows/location/WindowsRuntimeLocationChild.cpp ---
+    wrl_cpp = firefox_dir / "dom/system/windows/location/WindowsRuntimeLocationChild.cpp"
+    if wrl_cpp.is_file():
+        orig = wrl_cpp.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        if "[Könfox Win7]" not in patched:
+            if '#include "mozilla/WindowsVersion.h"' not in patched:
+                patched = patched.replace(
+                    '#include "WindowsRuntimeLocationChild.h"',
+                    '#include "WindowsRuntimeLocationChild.h"\n#include "mozilla/WindowsVersion.h"',
+                    1,
+                )
+            old_start = (
+                "  ComPtr<IInspectable> inspectable;\n"
+                "  HRESULT hr = RoActivateInstance("
+            )
+            new_start = (
+                "  // [Könfox Win7] WinRT Geolocator requires Windows 10+.\n"
+                "  if (!mozilla::IsWin10OrLater()) {\n"
+                "    return IPC_OK();\n"
+                "  }\n\n"
+                "  ComPtr<IInspectable> inspectable;\n"
+                "  HRESULT hr = RoActivateInstance("
+            )
+            if old_start in patched:
+                patched = patched.replace(old_start, new_start, 1)
+        if patched != orig:
+            if not dry_run:
+                wrl_cpp.write_text(patched, encoding="utf-8")
+            touched.append(str(wrl_cpp.relative_to(firefox_dir)))
+
+    # --- 23o. widget/windows/WinRegistry.cpp ---
+    # REG_NOTIFY_THREAD_AGNOSTIC is Windows 8+; passing it to
+    # RegNotifyChangeKeyValue on Win7 SP1 fails with ERROR_INVALID_PARAMETER,
+    # breaking registry watching (including system proxy change detection).
+    wreg_cpp = firefox_dir / "widget/windows/WinRegistry.cpp"
+    if wreg_cpp.is_file():
+        orig = wreg_cpp.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        if "[Könfox Win7]" not in patched:
+            if '#include "mozilla/WindowsVersion.h"' not in patched:
+                patched = patched.replace(
+                    '#include "WinRegistry.h"',
+                    '#include "WinRegistry.h"\n#include "mozilla/WindowsVersion.h"',
+                    1,
+                )
+            old_flags = (
+                "  DWORD flags = REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_ATTRIBUTES |\n"
+                "                REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_CHANGE_SECURITY |\n"
+                "                REG_NOTIFY_THREAD_AGNOSTIC;"
+            )
+            new_flags = (
+                "  DWORD flags = REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_ATTRIBUTES |\n"
+                "                REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_CHANGE_SECURITY;\n"
+                "  // [Könfox Win7] REG_NOTIFY_THREAD_AGNOSTIC requires Windows 8+.\n"
+                "  if (mozilla::IsWin8OrLater()) {\n"
+                "    flags |= REG_NOTIFY_THREAD_AGNOSTIC;\n"
+                "  }"
+            )
+            if old_flags in patched:
+                patched = patched.replace(old_flags, new_flags, 1)
+        if patched != orig:
+            if not dry_run:
+                wreg_cpp.write_text(patched, encoding="utf-8")
+            touched.append(str(wreg_cpp.relative_to(firefox_dir)))
+
+    # --- 23p. widget/windows/WinUtils.cpp ---
+    wu_cpp = firefox_dir / "widget/windows/WinUtils.cpp"
+    if wu_cpp.is_file():
+        orig = wu_cpp.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        if "[Könfox Win7]" not in patched:
+            old_pkg = "  sHasPackageIdentity = mozilla::HasPackageIdentity();"
+            new_pkg = (
+                "  // [Könfox Win7] Package identity requires Windows 8+.\n"
+                "  sHasPackageIdentity = mozilla::IsWin8OrLater() && mozilla::HasPackageIdentity();"
+            )
+            if old_pkg in patched:
+                patched = patched.replace(old_pkg, new_pkg, 1)
+        if patched != orig:
+            if not dry_run:
+                wu_cpp.write_text(patched, encoding="utf-8")
+            touched.append(str(wu_cpp.relative_to(firefox_dir)))
+
+    # --- 23q. widget/windows/nsWindow.cpp ---
+    # EVENT_OBJECT_CLOAKED/UNCLOAKED and TIP UIA workaround hooks are Win8+.
+    nw_cpp = firefox_dir / "widget/windows/nsWindow.cpp"
+    if nw_cpp.is_file():
+        orig = nw_cpp.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        if "[Könfox Win7]" not in patched:
+            old_tip = (
+                "  static void Initialize() {\n"
+                "    if (sInstance) {\n"
+                "      return;\n"
+                "    }"
+            )
+            new_tip = (
+                "  static void Initialize() {\n"
+                "    // [Könfox Win7] TIP UIA hook is only needed on Windows 8+.\n"
+                "    if (!IsWin8OrLater() || sInstance) {\n"
+                "      return;\n"
+                "    }"
+            )
+            old_cloak = "  if (!sWinCloakEventHook) {"
+            new_cloak = (
+                "  // [Könfox Win7] DWM cloaking events require Windows 8+.\n"
+                "  if (IsWin8OrLater() && !sWinCloakEventHook) {"
+            )
+            if old_tip in patched:
+                patched = patched.replace(old_tip, new_tip, 1)
+            if old_cloak in patched:
+                patched = patched.replace(old_cloak, new_cloak, 1)
+        if patched != orig:
+            if not dry_run:
+                nw_cpp.write_text(patched, encoding="utf-8")
+            touched.append(str(nw_cpp.relative_to(firefox_dir)))
+
+    # --- 23r. toolkit/crashreporter/nsExceptionHandler.cpp ---
+    # MiniDumpWithIndirectlyReferencedMemory triggers dbghelp.dll bugs on Win7.
+    eh_cpp = firefox_dir / "toolkit/crashreporter/nsExceptionHandler.cpp"
+    if eh_cpp.is_file():
+        orig = eh_cpp.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        if "[Könfox Win7]" not in patched:
+            if '#  include "mozilla/WindowsVersion.h"' not in patched:
+                patched = patched.replace(
+                    '#  include "mozilla/WindowsDllBlocklist.h"',
+                    '#  include "mozilla/WindowsDllBlocklist.h"\n#  include "mozilla/WindowsVersion.h"',
+                    1,
+                )
+            old_md = (
+                "  minidump_type = static_cast<MINIDUMP_TYPE>(\n"
+                "      minidump_type |\n"
+                "      // This is Nightly only because this doubles the size of minidumps based\n"
+                "      // on the experimental data.\n"
+                "      MiniDumpWithProcessThreadData |\n"
+                "      // This allows us to examine heap objects referenced from stack objects\n"
+                "      // at the cost of further doubling the size of minidumps.\n"
+                "      MiniDumpWithIndirectlyReferencedMemory);"
+            )
+            new_md = (
+                "  // [Könfox Win7] MiniDumpWithIndirectlyReferencedMemory fails on Win7 dbghelp.\n"
+                "  minidump_type = static_cast<MINIDUMP_TYPE>(\n"
+                "      minidump_type | MiniDumpWithProcessThreadData |\n"
+                "      (mozilla::IsWin8OrLater() ? MiniDumpWithIndirectlyReferencedMemory : 0));"
+            )
+            if old_md in patched:
+                patched = patched.replace(old_md, new_md, 1)
+        if patched != orig:
+            if not dry_run:
+                eh_cpp.write_text(patched, encoding="utf-8")
+            touched.append(str(eh_cpp.relative_to(firefox_dir)))
+
     return touched
 
 
@@ -3010,6 +3525,252 @@ def patch_ipc_and_networking_win7(firefox_dir: Path, dry_run: bool) -> list[str]
             if not dry_run:
                 neqo_rs.write_text(patched, encoding="utf-8")
             touched.append(str(neqo_rs.relative_to(firefox_dir)))
+
+    # 25d. toolkit/xre/nsEmbedFunctions.cpp
+    # Pre-warm ole32.dll, advapi32.dll, and the CSPRNG (\Device\KsecDD via
+    # cryptbase.dll) BEFORE any sandboxed child process calls LowerToken().
+    # Without this, post-lockdown calls to RandomUint64() (SharedMemory, JS,
+    # Rust getrandom) fail with ERROR_ACCESS_DENIED on Windows 7 SP1.
+    ef_cpp = firefox_dir / "toolkit/xre/nsEmbedFunctions.cpp"
+    if ef_cpp.is_file():
+        orig = ef_cpp.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        if "[Könfox Win7]" not in patched:
+            if '#  include "mozilla/RandomNum.h"' not in patched:
+                patched = patched.replace(
+                    '#  include "WinUtils.h"',
+                    '#  include "WinUtils.h"\n#  include "mozilla/RandomNum.h"',
+                    1,
+                )
+            old_ts = (
+                "  if (aChildData->sandboxTargetServices) {\n"
+                "    SandboxTarget::Instance()->SetTargetServices(\n"
+                "        aChildData->sandboxTargetServices);\n"
+                "  }"
+            )
+            new_ts = (
+                "  // [Könfox Win7] Warm up ole32, advapi32, and the Win7 CSPRNG\n"
+                "  // (cryptbase.dll / \\Device\\KsecDD) before LowerToken() lockdown.\n"
+                '  ::LoadLibraryW(L"ole32.dll");\n'
+                '  ::LoadLibraryW(L"advapi32.dll");\n'
+                "  (void)mozilla::RandomUint64OrDie();\n\n"
+                "  if (aChildData->sandboxTargetServices) {\n"
+                "    SandboxTarget::Instance()->SetTargetServices(\n"
+                "        aChildData->sandboxTargetServices);\n"
+                "  }"
+            )
+            if old_ts in patched:
+                patched = patched.replace(old_ts, new_ts, 1)
+        if patched != orig:
+            if not dry_run:
+                ef_cpp.write_text(patched, encoding="utf-8")
+            touched.append(str(ef_cpp.relative_to(firefox_dir)))
+
+    # 25e. ipc/mscom/Utils.cpp
+    # SHCreateMemStream is not thread-safe on Windows 7; use CreateStreamOnHGlobal.
+    msu_cpp = firefox_dir / "ipc/mscom/Utils.cpp"
+    if msu_cpp.is_file():
+        orig = msu_cpp.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        if "[Könfox Win7]" not in patched:
+            if '#include "mozilla/WindowsVersion.h"' not in patched:
+                patched = patched.replace(
+                    '#include "mozilla/mscom/Utils.h"',
+                    '#include "mozilla/mscom/Utils.h"\n#include "mozilla/WindowsVersion.h"\n#include <cstring>',
+                    1,
+                )
+            old_stream = (
+                "  // If aInitBuf is null then initSize must be 0.\n"
+                "  UINT initSize = aInitBuf ? aInitBufSize : 0;\n"
+                "  stream = already_AddRefed<IStream>(::SHCreateMemStream(aInitBuf, initSize));\n"
+                "  if (!stream) {\n"
+                "    return E_OUTOFMEMORY;\n"
+                "  }\n\n"
+                "  if (!aInitBuf) {\n"
+                "    // Now we'll set the required size\n"
+                "    ULARGE_INTEGER newSize;\n"
+                "    newSize.QuadPart = aInitBufSize;\n"
+                "    hr = stream->SetSize(newSize);\n"
+                "    if (FAILED(hr)) {\n"
+                "      return hr;\n"
+                "    }\n"
+                "  }"
+            )
+            new_stream = (
+                "  if (!mozilla::IsWin8OrLater()) {\n"
+                "    // [Könfox Win7] SHCreateMemStream is not thread-safe on Windows 7;\n"
+                "    // fall back to CreateStreamOnHGlobal.\n"
+                "    HGLOBAL hMem = ::GlobalAlloc(GMEM_MOVEABLE, aInitBufSize);\n"
+                "    if (!hMem) {\n"
+                "      return E_OUTOFMEMORY;\n"
+                "    }\n"
+                "    if (aInitBuf) {\n"
+                "      void* dest = ::GlobalLock(hMem);\n"
+                "      if (!dest) {\n"
+                "        ::GlobalFree(hMem);\n"
+                "        return E_OUTOFMEMORY;\n"
+                "      }\n"
+                "      std::memcpy(dest, aInitBuf, aInitBufSize);\n"
+                "      ::GlobalUnlock(hMem);\n"
+                "    }\n"
+                "    hr = ::CreateStreamOnHGlobal(hMem, TRUE, getter_AddRefs(stream));\n"
+                "    if (FAILED(hr)) {\n"
+                "      ::GlobalFree(hMem);\n"
+                "      return hr;\n"
+                "    }\n"
+                "  } else {\n"
+                "    // If aInitBuf is null then initSize must be 0.\n"
+                "    UINT initSize = aInitBuf ? aInitBufSize : 0;\n"
+                "    stream = already_AddRefed<IStream>(::SHCreateMemStream(aInitBuf, initSize));\n"
+                "    if (!stream) {\n"
+                "      return E_OUTOFMEMORY;\n"
+                "    }\n\n"
+                "    if (!aInitBuf) {\n"
+                "      // Now we'll set the required size\n"
+                "      ULARGE_INTEGER newSize;\n"
+                "      newSize.QuadPart = aInitBufSize;\n"
+                "      hr = stream->SetSize(newSize);\n"
+                "      if (FAILED(hr)) {\n"
+                "        return hr;\n"
+                "      }\n"
+                "    }\n"
+                "  }"
+            )
+            if old_stream in patched:
+                patched = patched.replace(old_stream, new_stream, 1)
+        if patched != orig:
+            if not dry_run:
+                msu_cpp.write_text(patched, encoding="utf-8")
+            touched.append(str(msu_cpp.relative_to(firefox_dir)))
+
+    # 25f. toolkit/system/windowsproxy/WindowsInternetFunctionsWrapper.cpp
+    # Fall back from INTERNET_PER_CONN_FLAGS_UI (IE9+) to INTERNET_PER_CONN_FLAGS
+    # on Windows 7 systems where the _UI option fails.
+    wifw_cpp = (
+        firefox_dir
+        / "toolkit/system/windowsproxy/WindowsInternetFunctionsWrapper.cpp"
+    )
+    if wifw_cpp.is_file():
+        orig = wifw_cpp.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        if "[Könfox Win7]" not in patched:
+            old_q = (
+                "    if (!InternetQueryOptionW(nullptr, INTERNET_OPTION_PER_CONNECTION_OPTION,\n"
+                "                              &list, &size)) {\n"
+                '      LOG(("ReadAllOptionsLocked: InternetQueryOptionW failed"));\n'
+                "      return NS_ERROR_FAILURE;\n"
+                "    }"
+            )
+            new_q = (
+                "    if (!InternetQueryOptionW(nullptr, INTERNET_OPTION_PER_CONNECTION_OPTION,\n"
+                "                              &list, &size)) {\n"
+                "      // [Könfox Win7] Retry with INTERNET_PER_CONN_FLAGS on Win7.\n"
+                "      options[0].dwOption = INTERNET_PER_CONN_FLAGS;\n"
+                "      list.dwOptionError = 0;\n"
+                "      size = sizeof(INTERNET_PER_CONN_OPTION_LISTW);\n"
+                "      if (!InternetQueryOptionW(nullptr, INTERNET_OPTION_PER_CONNECTION_OPTION,\n"
+                "                                &list, &size)) {\n"
+                '        LOG(("ReadAllOptionsLocked: InternetQueryOptionW failed"));\n'
+                "        return NS_ERROR_FAILURE;\n"
+                "      }\n"
+                "    }"
+            )
+            if old_q in patched:
+                patched = patched.replace(old_q, new_q, 1)
+        if patched != orig:
+            if not dry_run:
+                wifw_cpp.write_text(patched, encoding="utf-8")
+            touched.append(str(wifw_cpp.relative_to(firefox_dir)))
+
+    # 25g. third_party/rust/quinn-udp/src/windows.rs (+ .cargo-checksum.json)
+    # Windows 7 does not support Win10+ UDP_SEND_MSG_SIZE / IP_ECN / IPV6_ECN
+    # and may return WSAEINVAL on IP_RECVECN / WSASendMsg. Disable GSO and
+    # fall back cleanly to socket.0.send_to() when no cmsgs are needed or
+    # WSASendMsg rejects the options.
+    quinn_dir = firefox_dir / "third_party/rust/quinn-udp"
+    quinn_rs = quinn_dir / "src/windows.rs"
+    if quinn_rs.is_file():
+        orig = quinn_rs.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        if "[Könfox Win7]" not in patched:
+            old_ecn = (
+                "                    if code == WinSock::WSAENOPROTOOPT\n"
+                "                    || code == WinSock::WSAEOPNOTSUPP"
+            )
+            new_ecn = (
+                "                    // [Könfox Win7] Win7 Winsock may return WSAEINVAL for IP_RECVECN.\n"
+                "                    if code == WinSock::WSAENOPROTOOPT\n"
+                "                    || code == WinSock::WSAEOPNOTSUPP\n"
+                "                    || code == WinSock::WSAEINVAL"
+            )
+            old_gso = "            max_gso_segments: AtomicUsize::new(max_gso_segments(&*socket.0)),"
+            new_gso = (
+                "            // [Könfox Win7] Disable UDP GSO on Windows 7.\n"
+                "            max_gso_segments: AtomicUsize::new(1),"
+            )
+            old_send_call = (
+                "    let mut len = 0;\n"
+                "    let rc = unsafe {\n"
+                "        WinSock::WSASendMsg(\n"
+                "            socket.0.as_raw_socket() as usize,\n"
+                "            &wsa_msg,\n"
+                "            0,\n"
+                "            &mut len,\n"
+                "            ptr::null_mut(),\n"
+                "            None,\n"
+                "        )\n"
+                "    };\n\n"
+                "    match rc {\n"
+                "        0 => Ok(()),\n"
+                "        _ => Err(io::Error::last_os_error()),\n"
+                "    }"
+            )
+            new_send_call = (
+                "    // [Könfox Win7] Use send_to directly when no control messages are\n"
+                "    // attached, and fall back to send_to if WSASendMsg fails on Win7.\n"
+                "    if wsa_msg.Control.len == 0 {\n"
+                "        return socket.0.send_to(transmit.contents, &daddr).map(|_| ());\n"
+                "    }\n\n"
+                "    let mut len = 0;\n"
+                "    let rc = unsafe {\n"
+                "        WinSock::WSASendMsg(\n"
+                "            socket.0.as_raw_socket() as usize,\n"
+                "            &wsa_msg,\n"
+                "            0,\n"
+                "            &mut len,\n"
+                "            ptr::null_mut(),\n"
+                "            None,\n"
+                "        )\n"
+                "    };\n\n"
+                "    match rc {\n"
+                "        0 => Ok(()),\n"
+                "        _ => {\n"
+                "            let err = io::Error::last_os_error();\n"
+                "            if matches!(\n"
+                "                err.raw_os_error(),\n"
+                "                Some(code)\n"
+                "                    if code == WinSock::WSAEINVAL\n"
+                "                    || code == WinSock::WSAENOPROTOOPT\n"
+                "                    || code == WinSock::WSAEOPNOTSUPP\n"
+                "            ) {\n"
+                "                socket.0.send_to(transmit.contents, &daddr).map(|_| ())\n"
+                "            } else {\n"
+                "                Err(err)\n"
+                "            }\n"
+                "        }\n"
+                "    }"
+            )
+            if old_ecn in patched:
+                patched = patched.replace(old_ecn, new_ecn, 1)
+            if old_gso in patched:
+                patched = patched.replace(old_gso, new_gso, 1)
+            if old_send_call in patched:
+                patched = patched.replace(old_send_call, new_send_call, 1)
+        if patched != orig:
+            if not dry_run:
+                quinn_rs.write_text(patched, encoding="utf-8")
+                update_cargo_checksum(quinn_dir, "src/windows.rs")
+            touched.append(f"{quinn_rs.relative_to(firefox_dir)} (+ .cargo-checksum.json)")
 
     return touched
 

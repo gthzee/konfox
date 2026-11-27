@@ -961,6 +961,114 @@ class KonfoxToolchainTests(unittest.TestCase):
             self.assertEqual(apply_win7_patches.patch_win7_titlebar_icons(ff, False), [])
             self.assertEqual(apply_win7_patches.patch_remove_ai_features(ff, False), [])
 
+    def test_win7_run13_runtime_hang_and_crash_fixes(self) -> None:
+        """Verify Run #13 fixes for Win7 browsing hang, initial crash, zombie exit, and freezes."""
+        with tempfile.TemporaryDirectory() as tmp:
+            ff = Path(tmp) / "firefox"
+            files = {
+                "mozglue/misc/Futex_windows.cpp": "return ::WaitOnAddress(&mValue, &aExpected, 4, 0);\n",
+                "intl/locale/windows/OSPreferences_win.cpp": (
+                    '#include "OSPreferences.h"\n'
+                    "  if (SUCCEEDED(RoGetActivationFactory(\n"
+                    "          HStringReference(\n"
+                    "              RuntimeClass_Windows_System_UserProfile_GlobalizationPreferences)\n"
+                    "              .Get(),\n"
+                ),
+                "toolkit/xre/nsEmbedFunctions.cpp": (
+                    '#  include "WinUtils.h"\n'
+                    "  if (aChildData->sandboxTargetServices) {\n"
+                    "    SandboxTarget::Instance()->SetTargetServices(\n"
+                    "        aChildData->sandboxTargetServices);\n"
+                    "  }\n"
+                ),
+                "widget/windows/WinRegistry.cpp": (
+                    '#include "WinRegistry.h"\n'
+                    "  DWORD flags = REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_ATTRIBUTES |\n"
+                    "                REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_CHANGE_SECURITY |\n"
+                    "                REG_NOTIFY_THREAD_AGNOSTIC;\n"
+                ),
+                "toolkit/system/windowsproxy/WindowsInternetFunctionsWrapper.cpp": (
+                    "    if (!InternetQueryOptionW(nullptr, INTERNET_OPTION_PER_CONNECTION_OPTION,\n"
+                    "                              &list, &size)) {\n"
+                    '      LOG(("ReadAllOptionsLocked: InternetQueryOptionW failed"));\n'
+                    "      return NS_ERROR_FAILURE;\n"
+                    "    }\n"
+                ),
+                "ipc/mscom/Utils.cpp": (
+                    '#include "mozilla/mscom/Utils.h"\n'
+                    "  // If aInitBuf is null then initSize must be 0.\n"
+                    "  UINT initSize = aInitBuf ? aInitBufSize : 0;\n"
+                    "  stream = already_AddRefed<IStream>(::SHCreateMemStream(aInitBuf, initSize));\n"
+                    "  if (!stream) {\n"
+                    "    return E_OUTOFMEMORY;\n"
+                    "  }\n\n"
+                    "  if (!aInitBuf) {\n"
+                    "    // Now we'll set the required size\n"
+                    "    ULARGE_INTEGER newSize;\n"
+                    "    newSize.QuadPart = aInitBufSize;\n"
+                    "    hr = stream->SetSize(newSize);\n"
+                    "    if (FAILED(hr)) {\n"
+                    "      return hr;\n"
+                    "    }\n"
+                    "  }\n"
+                ),
+                "third_party/rust/quinn-udp/src/windows.rs": (
+                    "                    if code == WinSock::WSAENOPROTOOPT\n"
+                    "                    || code == WinSock::WSAEOPNOTSUPP\n"
+                    "            max_gso_segments: AtomicUsize::new(max_gso_segments(&*socket.0)),\n"
+                    "    let mut len = 0;\n"
+                    "    let rc = unsafe {\n"
+                    "        WinSock::WSASendMsg(\n"
+                    "            socket.0.as_raw_socket() as usize,\n"
+                    "            &wsa_msg,\n"
+                    "            0,\n"
+                    "            &mut len,\n"
+                    "            ptr::null_mut(),\n"
+                    "            None,\n"
+                    "        )\n"
+                    "    };\n\n"
+                    "    match rc {\n"
+                    "        0 => Ok(()),\n"
+                    "        _ => Err(io::Error::last_os_error()),\n"
+                    "    }\n"
+                ),
+                "third_party/rust/quinn-udp/.cargo-checksum.json": (
+                    '{"files":{"src/windows.rs":"0000"},"package":null}'
+                ),
+            }
+            for rel, content in files.items():
+                p = ff / rel
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(content, encoding="utf-8")
+
+            self.assertEqual(len(apply_win7_patches.patch_mozglue_futex_and_mincore(ff, False)), 1)
+            self.assertEqual(len(apply_win7_patches.patch_winrt_and_widget_win7(ff, False)), 2)
+            self.assertEqual(len(apply_win7_patches.patch_ipc_and_networking_win7(ff, False)), 4)
+
+            futex_code = "\n".join(
+                l for l in (ff / "mozglue/misc/Futex_windows.cpp").read_text(encoding="utf-8").splitlines()
+                if not l.lstrip().startswith("//")
+            )
+            self.assertNotIn("LoadLibrary", futex_code)
+            self.assertNotIn("InitOnceExecuteOnce", futex_code)
+            self.assertIn('GetModuleHandleW(L"kernelbase.dll")', futex_code)
+
+            self.assertIn("mozilla::IsWin8OrLater()", (ff / "intl/locale/windows/OSPreferences_win.cpp").read_text(encoding="utf-8"))
+            self.assertIn("mozilla::RandomUint64OrDie()", (ff / "toolkit/xre/nsEmbedFunctions.cpp").read_text(encoding="utf-8"))
+            self.assertIn("flags |= REG_NOTIFY_THREAD_AGNOSTIC;", (ff / "widget/windows/WinRegistry.cpp").read_text(encoding="utf-8"))
+            self.assertIn("INTERNET_PER_CONN_FLAGS;", (ff / "toolkit/system/windowsproxy/WindowsInternetFunctionsWrapper.cpp").read_text(encoding="utf-8"))
+            self.assertIn("CreateStreamOnHGlobal", (ff / "ipc/mscom/Utils.cpp").read_text(encoding="utf-8"))
+            quinn_text = (ff / "third_party/rust/quinn-udp/src/windows.rs").read_text(encoding="utf-8")
+            self.assertIn("WinSock::WSAEINVAL", quinn_text)
+            self.assertIn("socket.0.send_to(transmit.contents, &daddr)", quinn_text)
+            cs = json.loads((ff / "third_party/rust/quinn-udp/.cargo-checksum.json").read_text(encoding="utf-8"))
+            self.assertNotEqual(cs["files"]["src/windows.rs"], "0000")
+
+            # Pass 2: 100% idempotent
+            self.assertEqual(apply_win7_patches.patch_mozglue_futex_and_mincore(ff, False), [])
+            self.assertEqual(apply_win7_patches.patch_winrt_and_widget_win7(ff, False), [])
+            self.assertEqual(apply_win7_patches.patch_ipc_and_networking_win7(ff, False), [])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
