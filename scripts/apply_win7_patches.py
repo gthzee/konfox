@@ -2060,10 +2060,93 @@ def patch_chromium_sandbox_runtime_win7(firefox_dir: Path, dry_run: bool) -> lis
                     "  }",
                     1,
                 )
+        # [Könfox Win7 component filter] PROC_THREAD_ATTRIBUTE_COMPONENT_FILTER
+        # (COMPONENT_KTM) requires Windows 10 20H1+. On Windows 7 SP1,
+        # UpdateProcThreadAttribute fails with ERROR_INVALID_PARAMETER (not
+        # ERROR_NOT_SUPPORTED), which aborts EVERY child-process launch!
+        if "[Könfox Win7 component filter]" not in patched:
+            ktm_anchor = (
+                "void ConvertProcessMitigationsToComponentFilter(MitigationFlags flags,\n"
+                "                                                COMPONENT_FILTER* filter) {\n"
+                "  filter->ComponentFlags = 0;\n"
+                "  if (flags & MITIGATION_KTM_COMPONENT) {"
+            )
+            if ktm_anchor in patched:
+                patched = patched.replace(
+                    ktm_anchor,
+                    (
+                        "void ConvertProcessMitigationsToComponentFilter(MitigationFlags flags,\n"
+                        "                                                COMPONENT_FILTER* filter) {\n"
+                        "  filter->ComponentFlags = 0;\n"
+                        "  // [Könfox Win7 component filter] PROC_THREAD_ATTRIBUTE_COMPONENT_FILTER requires Win10 20H1+.\n"
+                        "  if (base::win::GetVersion() < base::win::Version::WIN10_20H1) {\n"
+                        "    return;\n"
+                        "  }\n"
+                        "  if (flags & MITIGATION_KTM_COMPONENT) {"
+                    ),
+                    1,
+                )
+        # [Könfox Win7 dll search] On unpatched Windows 7 SP1 without KB2533623,
+        # SetDefaultDllDirectories does not exist (shim returns FALSE with
+        # ERROR_PROC_NOT_FOUND). Do not abort child startup in that case.
+        if "[Könfox Win7 dll search]" not in patched:
+            dll_dir_anchor = (
+                "  if (flags & MITIGATION_DLL_SEARCH_ORDER) {\n"
+                "    if (!::SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS)) {\n"
+                "      return false;\n"
+                "    }"
+            )
+            if dll_dir_anchor in patched:
+                patched = patched.replace(
+                    dll_dir_anchor,
+                    (
+                        "  if (flags & MITIGATION_DLL_SEARCH_ORDER) {\n"
+                        "    // [Könfox Win7 dll search] Tolerate missing SetDefaultDllDirectories on Win7 without KB2533623.\n"
+                        "    if (!::SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS) &&\n"
+                        "        ::GetLastError() != ERROR_PROC_NOT_FOUND) {\n"
+                        "      return false;\n"
+                        "    }"
+                    ),
+                    1,
+                )
         if patched != orig:
             if not dry_run:
                 pm_cc.write_text(patched, encoding="utf-8")
             touched.append(str(pm_cc.relative_to(firefox_dir)))
+
+    # --- 21a2. startup_information_helper.cc (belt-and-suspenders for COMPONENT_FILTER) ---
+    sih_cc = firefox_dir / "security/sandbox/chromium/sandbox/win/src/startup_information_helper.cc"
+    if sih_cc.is_file():
+        orig = sih_cc.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        if "[Könfox Win7 component filter]" not in patched:
+            cf_anchor = (
+                "    if (!startup_info_.UpdateProcThreadAttribute(\n"
+                "            PROC_THREAD_ATTRIBUTE_COMPONENT_FILTER, &component_filter_,\n"
+                "            sizeof(component_filter_)) &&\n"
+                "        ::GetLastError() != ERROR_NOT_SUPPORTED) {\n"
+                "      return false;\n"
+                "    }"
+            )
+            if cf_anchor in patched:
+                patched = patched.replace(
+                    cf_anchor,
+                    (
+                        "    // [Könfox Win7 component filter] Win7 returns ERROR_INVALID_PARAMETER for unknown attributes.\n"
+                        "    if (!startup_info_.UpdateProcThreadAttribute(\n"
+                        "            PROC_THREAD_ATTRIBUTE_COMPONENT_FILTER, &component_filter_,\n"
+                        "            sizeof(component_filter_)) &&\n"
+                        "        ::GetLastError() != ERROR_NOT_SUPPORTED &&\n"
+                        "        ::GetLastError() != ERROR_INVALID_PARAMETER) {\n"
+                        "      return false;\n"
+                        "    }"
+                    ),
+                    1,
+                )
+        if patched != orig:
+            if not dry_run:
+                sih_cc.write_text(patched, encoding="utf-8")
+            touched.append(str(sih_cc.relative_to(firefox_dir)))
 
     # --- 21b. broker_services.cc ---
     bs_cc = firefox_dir / "security/sandbox/chromium/sandbox/win/src/broker_services.cc"
@@ -2792,6 +2875,435 @@ def patch_memory_tracker_win7(firefox_dir: Path, dry_run: bool) -> list[str]:
     return touched
 
 
+# ---------------------------------------------------------------------------
+# 25. IPC (MSCOM AppContainer SID + Win7 Freezable ShMem) & Neqo HTTP/3 Win7
+# ---------------------------------------------------------------------------
+def patch_ipc_and_networking_win7(firefox_dir: Path, dry_run: bool) -> list[str]:
+    """
+    Fixes remaining Windows 7 SP1 x64 IPC / networking incompatibilities:
+      - ipc/mscom/ProcessRuntime.cpp: guard WinBuiltinAnyPackageSid and
+        TokenAppContainerSid behind IsWin8OrLater() so ProcessRuntime::
+        InitializeSecurity() succeeds on Windows 7 SP1.
+      - ipc/glue/SharedMemoryPlatform_windows.cpp: give freezable shared memory
+        mappings a random name on < Win8.1 because Windows 7 ignores
+        SECURITY_ATTRIBUTES on unnamed file mappings.
+      - netwerk/socket/neqo_glue/src/lib.rs: disable pmtud_iface_mtu on Windows
+        to avoid unsupported Win7 interface MTU queries in HTTP/3 QUIC.
+    """
+    touched: list[str] = []
+
+    # 25a. ipc/mscom/ProcessRuntime.cpp
+    pr_cpp = firefox_dir / "ipc/mscom/ProcessRuntime.cpp"
+    if pr_cpp.is_file():
+        orig = pr_cpp.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        if "[Könfox Win7]" not in patched:
+            if '#include "mozilla/WindowsVersion.h"' not in patched:
+                patched = patched.replace(
+                    '#include "mozilla/WindowsProcessMitigations.h"',
+                    '#include "mozilla/WindowsVersion.h"\n#include "mozilla/WindowsProcessMitigations.h"',
+                    1,
+                )
+            old_parent = "  if (aProcessCategory == ProcessCategory::GeckoBrowserParent) {"
+            new_parent = (
+                "  // [Könfox Win7] AppContainer SIDs (WinBuiltinAnyPackageSid) require Windows 8+.\n"
+                "  const bool appContainersSupported = mozilla::IsWin8OrLater();\n"
+                "  if (aProcessCategory == ProcessCategory::GeckoBrowserParent &&\n"
+                "      appContainersSupported) {"
+            )
+            old_tok = (
+                "  bool haveAppContainerSid =\n"
+                "      ::GetTokenInformation(processToken, TokenAppContainerSid,"
+            )
+            new_tok = (
+                "  bool haveAppContainerSid =\n"
+                "      appContainersSupported &&\n"
+                "      ::GetTokenInformation(processToken, TokenAppContainerSid,"
+            )
+            if old_parent in patched and old_tok in patched:
+                patched = patched.replace(old_parent, new_parent, 1).replace(
+                    old_tok, new_tok, 1
+                )
+        if patched != orig:
+            if not dry_run:
+                pr_cpp.write_text(patched, encoding="utf-8")
+            touched.append(str(pr_cpp.relative_to(firefox_dir)))
+
+    # 25b. ipc/glue/SharedMemoryPlatform_windows.cpp
+    shm_cpp = firefox_dir / "ipc/glue/SharedMemoryPlatform_windows.cpp"
+    if shm_cpp.is_file():
+        orig = shm_cpp.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        if "[Könfox Win7]" not in patched:
+            if '#include "mozilla/WindowsVersion.h"' not in patched:
+                patched = patched.replace(
+                    '#include "nsDebug.h"',
+                    (
+                        '#include "nsDebug.h"\n'
+                        "#include <cwchar>\n"
+                        "#include <iterator>\n"
+                        '#include "mozilla/RandomNum.h"\n'
+                        '#include "mozilla/WindowsVersion.h"'
+                    ),
+                    1,
+                )
+            old_dacl = "  ACL dacl;\n\n  if (aFreezable) {"
+            new_dacl = (
+                "  ACL dacl;\n"
+                "  wchar_t name[80] = {};\n\n"
+                "  if (aFreezable) {"
+            )
+            old_sd = (
+                "        NS_WARN_IF(!::SetSecurityDescriptorDacl(&sd, TRUE, &dacl, FALSE))) {\n"
+                "      return Nothing();\n"
+                "    }\n"
+                "  }\n\n"
+                "  auto handle = MozCreateFileMappingW(psa, PAGE_READWRITE, 0,\n"
+                "                                      static_cast<DWORD>(aSize), nullptr);"
+            )
+            new_sd = (
+                "        NS_WARN_IF(!::SetSecurityDescriptorDacl(&sd, TRUE, &dacl, FALSE))) {\n"
+                "      return Nothing();\n"
+                "    }\n\n"
+                "    // [Könfox Win7] Windows 7 ignores SECURITY_ATTRIBUTES on unnamed\n"
+                "    // file mappings; assign a random name on < Windows 8.1.\n"
+                "    if (!mozilla::IsWin8Point1OrLater()) {\n"
+                "      mozilla::Maybe<uint64_t> r0 = mozilla::RandomUint64();\n"
+                "      mozilla::Maybe<uint64_t> r1 = mozilla::RandomUint64();\n"
+                "      mozilla::Maybe<uint64_t> r2 = mozilla::RandomUint64();\n"
+                "      mozilla::Maybe<uint64_t> r3 = mozilla::RandomUint64();\n"
+                "      if (NS_WARN_IF(r0.isNothing() || r1.isNothing() ||\n"
+                "                     r2.isNothing() || r3.isNothing())) {\n"
+                "        return Nothing();\n"
+                "      }\n"
+                "      swprintf_s(name, std::size(name),\n"
+                '                 L"MozSharedMem_%016llx%016llx%016llx%016llx",\n'
+                "                 static_cast<unsigned long long>(*r0),\n"
+                "                 static_cast<unsigned long long>(*r1),\n"
+                "                 static_cast<unsigned long long>(*r2),\n"
+                "                 static_cast<unsigned long long>(*r3));\n"
+                "    }\n"
+                "  }\n\n"
+                "  auto handle = MozCreateFileMappingW(\n"
+                "      psa, PAGE_READWRITE, 0, static_cast<DWORD>(aSize),\n"
+                "      name[0] ? name : nullptr);"
+            )
+            if old_dacl in patched and old_sd in patched:
+                patched = patched.replace(old_dacl, new_dacl, 1).replace(
+                    old_sd, new_sd, 1
+                )
+        if patched != orig:
+            if not dry_run:
+                shm_cpp.write_text(patched, encoding="utf-8")
+            touched.append(str(shm_cpp.relative_to(firefox_dir)))
+
+    # 25c. netwerk/socket/neqo_glue/src/lib.rs
+    neqo_rs = firefox_dir / "netwerk/socket/neqo_glue/src/lib.rs"
+    if neqo_rs.is_file():
+        orig = neqo_rs.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        old_pmtud = '.pmtud_iface_mtu(cfg!(not(target_os = "openbsd")))'
+        new_pmtud = '.pmtud_iface_mtu(cfg!(not(any(target_os = "openbsd", target_os = "windows"))))'
+        if old_pmtud in patched:
+            patched = patched.replace(old_pmtud, new_pmtud, 1)
+        if patched != orig:
+            if not dry_run:
+                neqo_rs.write_text(patched, encoding="utf-8")
+            touched.append(str(neqo_rs.relative_to(firefox_dir)))
+
+    return touched
+
+
+# ---------------------------------------------------------------------------
+# 26. Windows 7 SP1 Titlebar Caption Icons (Minimize / Maximize / Restore / Close)
+# ---------------------------------------------------------------------------
+def patch_win7_titlebar_icons(firefox_dir: Path, dry_run: bool) -> list[str]:
+    """
+    Firefox 163 draws Windows titlebar caption buttons using Private-Use-Area
+    glyphs (\\e921/\\e922/\\e923/\\e8bb) from "Segoe Fluent Icons" (Win11) and
+    "Segoe MDL2 Assets" (Win10). Neither font exists on Windows 7 SP1, so the
+    buttons render as missing-glyph tofu boxes.
+
+    Replace the font-glyph rendering with crisp 10x10 vector SVG CSS mask-images
+    tinted by `background-color: currentColor` so Minimize, Maximize, Restore,
+    and Close render sharply on Windows 7 SP1 (and 8/10/11) across Light mode,
+    Dark mode, High Contrast, active/inactive states, and red Close hover.
+    """
+    touched: list[str] = []
+    bcss = firefox_dir / "browser/themes/windows/browser.css"
+    if not bcss.is_file():
+        return touched
+
+    orig = bcss.read_text(encoding="utf-8", errors="replace")
+    patched = orig
+    if "[Könfox Win7 titlebar icons]" not in patched:
+        old_before = (
+            "  &::before {\n"
+            "    display: inline-block;\n"
+            "    content: inherit;\n"
+            "\n"
+            "    &:-moz-locale-dir(rtl) {\n"
+            "      transform: scaleX(-1);\n"
+            "    }\n"
+            "  }"
+        )
+        new_before = (
+            "  /* [Könfox Win7 titlebar icons] Vector SVG mask icons instead of Win10/11-only Segoe MDL2/Fluent glyphs. */\n"
+            "  &::before {\n"
+            "    display: inline-block;\n"
+            '    content: "";\n'
+            "    width: 10px;\n"
+            "    height: 10px;\n"
+            "    background-color: currentColor;\n"
+            "    forced-color-adjust: none;\n"
+            "    mask-size: 10px 10px;\n"
+            "    mask-repeat: no-repeat;\n"
+            "    mask-position: center;\n"
+            "    vertical-align: middle;\n"
+            "\n"
+            "    &:-moz-locale-dir(rtl) {\n"
+            "      transform: scaleX(-1);\n"
+            "    }\n"
+            "  }"
+        )
+
+        old_buttons = (
+            ".titlebar-min {\n"
+            "  /* Even though we use appearance: none, -moz-default-appearance is necessary\n"
+            '   * for Windows 11\'s "snap layouts" feature, see\n'
+            "   * DealWithWindowsAppearanceHacks */\n"
+            "  -moz-default-appearance: -moz-window-button-minimize;\n"
+            '  content: "\\e921"; /* ChromeMinimize */\n'
+            "  @media (prefers-contrast) {\n"
+            '    content: "\\ef2d"; /* ChromeMinimizeContrast */\n'
+            "  }\n"
+            "}\n"
+            "\n"
+            ".titlebar-max {\n"
+            "  -moz-default-appearance: -moz-window-button-maximize;\n"
+            '  content: "\\e922"; /* ChromeMaximize */\n'
+            "  @media (prefers-contrast) {\n"
+            '    content: "\\ef2e"; /* ChromeMaximizeContrast */\n'
+            "  }\n"
+            "}\n"
+            "\n"
+            ".titlebar-restore {\n"
+            "  -moz-default-appearance: -moz-window-button-restore;\n"
+            '  content: "\\e923"; /* ChromeRestore */\n'
+            "  @media (prefers-contrast) {\n"
+            '    content: "\\ef2f"; /* ChromeRestoreContrast */\n'
+            "  }\n"
+            "}\n"
+            "\n"
+            ".titlebar-close {\n"
+            "  -moz-default-appearance: -moz-window-button-close;\n"
+            '  content: "\\e8bb"; /* ChromeClose */\n'
+            "  @media (prefers-contrast) {\n"
+            '    content: "\\ef2c"; /* ChromeCloseContrast */\n'
+            "  }\n"
+            "}"
+        )
+        new_buttons = (
+            ".titlebar-min {\n"
+            "  /* Even though we use appearance: none, -moz-default-appearance is necessary\n"
+            '   * for Windows 11\'s "snap layouts" feature, see\n'
+            "   * DealWithWindowsAppearanceHacks */\n"
+            "  -moz-default-appearance: -moz-window-button-minimize;\n"
+            "  &::before {\n"
+            '    mask-image: url("data:image/svg+xml,%3Csvg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 10 10\'%3E%3Crect x=\'0\' y=\'5\' width=\'10\' height=\'1\' fill=\'%23000\'/%3E%3C/svg%3E");\n'
+            "  }\n"
+            "}\n"
+            "\n"
+            ".titlebar-max {\n"
+            "  -moz-default-appearance: -moz-window-button-maximize;\n"
+            "  &::before {\n"
+            '    mask-image: url("data:image/svg+xml,%3Csvg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 10 10\'%3E%3Cpath d=\'M0.5 0.5h9v9h-9z\' fill=\'none\' stroke=\'%23000\' stroke-width=\'1\'/%3E%3C/svg%3E");\n'
+            "  }\n"
+            "}\n"
+            "\n"
+            ".titlebar-restore {\n"
+            "  -moz-default-appearance: -moz-window-button-restore;\n"
+            "  &::before {\n"
+            '    mask-image: url("data:image/svg+xml,%3Csvg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 10 10\'%3E%3Cpath d=\'M2.5 2.5V0.5h7v7H7.5M0.5 2.5h7v7h-7z\' fill=\'none\' stroke=\'%23000\' stroke-width=\'1\'/%3E%3C/svg%3E");\n'
+            "  }\n"
+            "}\n"
+            "\n"
+            ".titlebar-close {\n"
+            "  -moz-default-appearance: -moz-window-button-close;\n"
+            "  &::before {\n"
+            '    mask-image: url("data:image/svg+xml,%3Csvg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 10 10\'%3E%3Cpath d=\'M0.5 0.5l9 9M9.5 0.5l-9 9\' fill=\'none\' stroke=\'%23000\' stroke-width=\'1.1\'/%3E%3C/svg%3E");\n'
+            "  }\n"
+            "}"
+        )
+
+        if old_before in patched and old_buttons in patched:
+            patched = patched.replace(old_before, new_before, 1).replace(
+                old_buttons, new_buttons, 1
+            )
+
+    if patched != orig:
+        if not dry_run:
+            bcss.write_text(patched, encoding="utf-8")
+        touched.append(str(bcss.relative_to(firefox_dir)))
+    return touched
+
+
+# ---------------------------------------------------------------------------
+# 27. Remove all AI / ML / GenAI features & "AI Controls" UI from Könfox
+# ---------------------------------------------------------------------------
+def patch_remove_ai_features(firefox_dir: Path, dry_run: bool) -> list[str]:
+    """
+    Completely removes "AI Controls" from Settings and disables all AI / ML /
+    GenAI integrations (Sidebar AI Chatbot, Smart Window / AI Tab, Smart Tab
+    Groups, Link Preview AI, PDF.js AI Alt Text, AI Translations, Extensions
+    ML API, and on-device model downloads) at both UI and default-pref layers.
+    """
+    touched: list[str] = []
+
+    def _replace_pairs(rel_path: str, pairs: list[tuple[str, str]]) -> None:
+        fpath = firefox_dir / rel_path
+        if not fpath.is_file():
+            return
+        orig = fpath.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        for old, new in pairs:
+            if old in patched and new not in patched:
+                patched = patched.replace(old, new)
+        if patched != orig:
+            if not dry_run:
+                fpath.write_text(patched, encoding="utf-8")
+            touched.append(rel_path)
+
+    # 27a. Hide "AI Controls" navigation button in about:preferences
+    _replace_pairs(
+        "browser/components/preferences/preferences.xhtml",
+        [
+            (
+                '<html:moz-page-nav-button id="category-ai-features"\n'
+                '        view="paneAi"',
+                '<html:moz-page-nav-button id="category-ai-features"\n'
+                '        hidden="true"\n'
+                '        view="paneAi"',
+            ),
+        ],
+    )
+
+    # 27b. Force AI Controls pane permanently invisible in about:preferences
+    _replace_pairs(
+        "browser/components/preferences/preferences.js",
+        [
+            (
+                '    visible: () =>\n'
+                '      Services.prefs.getBoolPref("browser.preferences.aiControls", false),',
+                "    // [Könfox] AI Controls permanently removed.\n"
+                "    visible: () => false,",
+            ),
+        ],
+    )
+
+    # 27c. Remove AI Chatbot ("aichat") from default sidebar launcher tools
+    _replace_pairs(
+        "browser/components/sidebar/SidebarManager.sys.mjs",
+        [
+            (
+                '"opentabs,bookmarks,aichat,history,syncedtabs,passwords";',
+                '"opentabs,bookmarks,history,syncedtabs,passwords";',
+            ),
+        ],
+    )
+
+    # 27d. Flip core AI/ML default preferences in modules/libpref/init/all.js
+    _replace_pairs(
+        "modules/libpref/init/all.js",
+        [
+            ('pref("extensions.ml.enabled", true);', 'pref("extensions.ml.enabled", false);'),
+            ('pref("browser.ai.control.default", "available");', 'pref("browser.ai.control.default", "blocked");'),
+            ('pref("browser.ai.control.translations", "default");', 'pref("browser.ai.control.translations", "blocked");'),
+            ('pref("browser.ai.control.pdfjsAltText", "default");', 'pref("browser.ai.control.pdfjsAltText", "blocked");'),
+            ('pref("browser.ai.control.smartTabGroups", "default");', 'pref("browser.ai.control.smartTabGroups", "blocked");'),
+            ('pref("browser.ai.control.linkPreviewKeyPoints", "default");', 'pref("browser.ai.control.linkPreviewKeyPoints", "blocked");'),
+            ('pref("browser.ai.control.sidebarChatbot", "default");', 'pref("browser.ai.control.sidebarChatbot", "blocked");'),
+            ('pref("browser.ai.control.smartWindow", "default");', 'pref("browser.ai.control.smartWindow", "blocked");'),
+            ('pref("browser.ai.control.speechRecognition", "default");', 'pref("browser.ai.control.speechRecognition", "blocked");'),
+            ('pref("browser.ai.control.generatedWidgets", "default");', 'pref("browser.ai.control.generatedWidgets", "blocked");'),
+            ('pref("browser.ml.enable", true);', 'pref("browser.ml.enable", false);'),
+            ('pref("browser.ml.llama.hwInference", true);', 'pref("browser.ml.llama.hwInference", false);'),
+        ],
+    )
+
+    # 27e. Flip browser AI/GenAI/SmartWindow/SmartTab/Translations defaults in firefox.js
+    _replace_pairs(
+        "browser/app/profile/firefox.js",
+        [
+            ('pref("browser.preferences.aiControls", true);', 'pref("browser.preferences.aiControls", false);'),
+            ('pref("browser.tabs.groups.smart.enabled", true);', 'pref("browser.tabs.groups.smart.enabled", false);'),
+            ('pref("browser.ml.chat.enabled", true);', 'pref("browser.ml.chat.enabled", false);'),
+            ('pref("browser.ml.chat.menu", true);', 'pref("browser.ml.chat.menu", false);'),
+            ('pref("browser.ml.chat.page", true);', 'pref("browser.ml.chat.page", false);'),
+            ('pref("browser.ml.chat.page.footerBadge", true);', 'pref("browser.ml.chat.page.footerBadge", false);'),
+            ('pref("browser.ml.chat.page.menuBadge", true);', 'pref("browser.ml.chat.page.menuBadge", false);'),
+            ('pref("browser.ml.chat.shortcuts", true);', 'pref("browser.ml.chat.shortcuts", false);'),
+            ('pref("browser.ml.chat.shortcuts.custom", true);', 'pref("browser.ml.chat.shortcuts.custom", false);'),
+            ('pref("browser.ml.chat.shortcuts.smartwindow", true);', 'pref("browser.ml.chat.shortcuts.smartwindow", false);'),
+            ('pref("browser.ml.chat.sidebar", true);', 'pref("browser.ml.chat.sidebar", false);'),
+            ('pref("browser.ml.linkPreview.enabled", true);', 'pref("browser.ml.linkPreview.enabled", false);'),
+            ('pref("browser.ml.linkPreview.longPress", true);', 'pref("browser.ml.linkPreview.longPress", false);'),
+            ('pref("browser.smartwindow.autoTabGrouping.enabled", true);', 'pref("browser.smartwindow.autoTabGrouping.enabled", false);'),
+            ('pref("browser.smartwindow.autoTabGrouping.preloadModels", true);', 'pref("browser.smartwindow.autoTabGrouping.preloadModels", false);'),
+            ('pref("browser.smartwindow.smartformfill.enabled", true);', 'pref("browser.smartwindow.smartformfill.enabled", false);'),
+            ('pref("browser.smartwindow.aitab.menus", true);', 'pref("browser.smartwindow.aitab.menus", false);'),
+            ('pref("browser.smartwindow.agent.enabled", true);', 'pref("browser.smartwindow.agent.enabled", false);'),
+            ('pref("browser.smartwindow.agent.toolbar.enabled", true);', 'pref("browser.smartwindow.agent.toolbar.enabled", false);'),
+            ('pref("browser.smartwindow.agent.suggestions.enabled", true);', 'pref("browser.smartwindow.agent.suggestions.enabled", false);'),
+            ('pref("browser.smartwindow.memories.generateFromHistory", true);', 'pref("browser.smartwindow.memories.generateFromHistory", false);'),
+            ('pref("browser.smartwindow.memories.generateFromConversation", true);', 'pref("browser.smartwindow.memories.generateFromConversation", false);'),
+            ('pref("browser.smartwindow.resumeActivity.enabled", true);', 'pref("browser.smartwindow.resumeActivity.enabled", false);'),
+            ('pref("browser.smartwindow.sidebar.openByDefault", true);', 'pref("browser.smartwindow.sidebar.openByDefault", false);'),
+            ('pref("browser.translations.enable", true);', 'pref("browser.translations.enable", false);'),
+            ('pref("browser.translations.select.enable", true);', 'pref("browser.translations.select.enable", false);'),
+            ('pref("browser.translations.quickAction.enabled", true);', 'pref("browser.translations.quickAction.enabled", false);'),
+        ],
+    )
+
+    # 27f. Disable PDF.js AI Alt Text & model downloads
+    _replace_pairs(
+        "toolkit/components/pdfjs/PdfJsOverridePrefs.js",
+        [
+            ('pref("pdfjs.enableAltText", true);', 'pref("pdfjs.enableAltText", false);'),
+        ],
+    )
+    _replace_pairs(
+        "toolkit/components/pdfjs/PdfJsDefaultPrefs.js",
+        [
+            ('pref("pdfjs.enableAltTextModelDownload", true);', 'pref("pdfjs.enableAltTextModelDownload", false);'),
+        ],
+    )
+
+    # 27g. Disable StaticPrefList browser.smartwindow.aitab.enabled on Nightly
+    spl = firefox_dir / "modules/libpref/init/StaticPrefList.yaml"
+    if spl.is_file():
+        orig = spl.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        old_aitab = (
+            "- name: browser.smartwindow.aitab.enabled\n"
+            "  type: bool\n"
+            "  value: @IS_NIGHTLY_BUILD@"
+        )
+        new_aitab = (
+            "- name: browser.smartwindow.aitab.enabled\n"
+            "  type: bool\n"
+            "  value: false"
+        )
+        if old_aitab in patched:
+            patched = patched.replace(old_aitab, new_aitab, 1)
+        if patched != orig:
+            if not dry_run:
+                spl.write_text(patched, encoding="utf-8")
+            touched.append("modules/libpref/init/StaticPrefList.yaml")
+
+    return touched
+
+
 def patch_bootstrapped_windows_rs(windows_rs_dir: Path, dry_run: bool) -> list[str]:
     """
     Belt-and-suspenders patch for Mozilla's bootstrapped `~/.mozbuild/windows-rs`
@@ -2882,6 +3394,9 @@ def main() -> int:
         ("Graphics Win7 fixes (DirectComposition & D3D 11.1)", lambda: patch_graphics_win7(args.firefox_dir, args.dry_run)),
         ("WinRT, DPI, SkeletonUI & Widget Win7 guards", lambda: patch_winrt_and_widget_win7(args.firefox_dir, args.dry_run)),
         ("AvailableMemoryTracker HeapOptimizeResources Win7 guard", lambda: patch_memory_tracker_win7(args.firefox_dir, args.dry_run)),
+        ("IPC (MSCOM/ShMem) & Neqo HTTP/3 Win7 fixes", lambda: patch_ipc_and_networking_win7(args.firefox_dir, args.dry_run)),
+        ("Win7 SVG titlebar caption icons (min/max/restore/close)", lambda: patch_win7_titlebar_icons(args.firefox_dir, args.dry_run)),
+        ("Remove all AI / ML / GenAI features & AI Controls UI", lambda: patch_remove_ai_features(args.firefox_dir, args.dry_run)),
         ("patches/series", lambda: apply_patch_series(args.firefox_dir, args.patches_dir, args.dry_run)),
     ):
         touched = fn()

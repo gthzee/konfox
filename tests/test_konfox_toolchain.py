@@ -793,6 +793,174 @@ class KonfoxToolchainTests(unittest.TestCase):
             no_manifest.write_bytes(build_synthetic_pe64([("kernel32.dll", ["CreateFileW"])]) + manifest_xml)
             self.assertEqual(verify_win7_pe.audit_pe_file(no_manifest), [])
 
+    def test_win7_browsing_titlebar_icons_and_ai_removal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ff = Path(tmp) / "firefox"
+            ff.mkdir(parents=True)
+            (ff / "mach").write_text("#!/bin/sh\n", encoding="utf-8")
+
+            files = {
+                "security/sandbox/chromium/sandbox/win/src/process_mitigations.cc": (
+                    "  if (flags & MITIGATION_DLL_SEARCH_ORDER) {\n"
+                    "    if (!::SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS)) {\n"
+                    "      return false;\n"
+                    "    }\n"
+                    "  }\n"
+                    "void ConvertProcessMitigationsToComponentFilter(MitigationFlags flags,\n"
+                    "                                                COMPONENT_FILTER* filter) {\n"
+                    "  filter->ComponentFlags = 0;\n"
+                    "  if (flags & MITIGATION_KTM_COMPONENT) {\n"
+                    "    filter->ComponentFlags = COMPONENT_KTM;\n"
+                    "  }\n"
+                    "}\n"
+                ),
+                "security/sandbox/chromium/sandbox/win/src/startup_information_helper.cc": (
+                    "  if (component_filter_.ComponentFlags) {\n"
+                    "    if (!startup_info_.UpdateProcThreadAttribute(\n"
+                    "            PROC_THREAD_ATTRIBUTE_COMPONENT_FILTER, &component_filter_,\n"
+                    "            sizeof(component_filter_)) &&\n"
+                    "        ::GetLastError() != ERROR_NOT_SUPPORTED) {\n"
+                    "      return false;\n"
+                    "    }\n"
+                    "  }\n"
+                ),
+                "ipc/mscom/ProcessRuntime.cpp": (
+                    '#include "mozilla/WindowsProcessMitigations.h"\n'
+                    "  if (aProcessCategory == ProcessCategory::GeckoBrowserParent) {\n"
+                    "    ::CreateWellKnownSid(WinBuiltinAnyPackageSid, nullptr, &s, &sz);\n"
+                    "  }\n"
+                    "  bool haveAppContainerSid =\n"
+                    "      ::GetTokenInformation(processToken, TokenAppContainerSid, info, len, &len);\n"
+                ),
+                "ipc/glue/SharedMemoryPlatform_windows.cpp": (
+                    '#include "nsDebug.h"\n'
+                    "  ACL dacl;\n\n"
+                    "  if (aFreezable) {\n"
+                    "        NS_WARN_IF(!::SetSecurityDescriptorDacl(&sd, TRUE, &dacl, FALSE))) {\n"
+                    "      return Nothing();\n"
+                    "    }\n"
+                    "  }\n\n"
+                    "  auto handle = MozCreateFileMappingW(psa, PAGE_READWRITE, 0,\n"
+                    "                                      static_cast<DWORD>(aSize), nullptr);\n"
+                ),
+                "netwerk/socket/neqo_glue/src/lib.rs": (
+                    '            .pmtud_iface_mtu(cfg!(not(target_os = "openbsd")))\n'
+                ),
+                "browser/themes/windows/browser.css": (
+                    "  &::before {\n"
+                    "    display: inline-block;\n"
+                    "    content: inherit;\n"
+                    "\n"
+                    "    &:-moz-locale-dir(rtl) {\n"
+                    "      transform: scaleX(-1);\n"
+                    "    }\n"
+                    "  }\n"
+                    ".titlebar-min {\n"
+                    "  /* Even though we use appearance: none, -moz-default-appearance is necessary\n"
+                    '   * for Windows 11\'s "snap layouts" feature, see\n'
+                    "   * DealWithWindowsAppearanceHacks */\n"
+                    "  -moz-default-appearance: -moz-window-button-minimize;\n"
+                    '  content: "\\e921"; /* ChromeMinimize */\n'
+                    "  @media (prefers-contrast) {\n"
+                    '    content: "\\ef2d"; /* ChromeMinimizeContrast */\n'
+                    "  }\n"
+                    "}\n"
+                    "\n"
+                    ".titlebar-max {\n"
+                    "  -moz-default-appearance: -moz-window-button-maximize;\n"
+                    '  content: "\\e922"; /* ChromeMaximize */\n'
+                    "  @media (prefers-contrast) {\n"
+                    '    content: "\\ef2e"; /* ChromeMaximizeContrast */\n'
+                    "  }\n"
+                    "}\n"
+                    "\n"
+                    ".titlebar-restore {\n"
+                    "  -moz-default-appearance: -moz-window-button-restore;\n"
+                    '  content: "\\e923"; /* ChromeRestore */\n'
+                    "  @media (prefers-contrast) {\n"
+                    '    content: "\\ef2f"; /* ChromeRestoreContrast */\n'
+                    "  }\n"
+                    "}\n"
+                    "\n"
+                    ".titlebar-close {\n"
+                    "  -moz-default-appearance: -moz-window-button-close;\n"
+                    '  content: "\\e8bb"; /* ChromeClose */\n'
+                    "  @media (prefers-contrast) {\n"
+                    '    content: "\\ef2c"; /* ChromeCloseContrast */\n'
+                    "  }\n"
+                    "}\n"
+                ),
+                "browser/components/preferences/preferences.xhtml": (
+                    '<html:moz-page-nav-button id="category-ai-features"\n'
+                    '        view="paneAi">\n'
+                ),
+                "browser/components/preferences/preferences.js": (
+                    "  ai: {\n"
+                    "    visible: () =>\n"
+                    '      Services.prefs.getBoolPref("browser.preferences.aiControls", false),\n'
+                    "  },\n"
+                ),
+                "browser/components/sidebar/SidebarManager.sys.mjs": (
+                    'const DEFAULT_LAUNCHER_TOOLS =\n'
+                    '  "opentabs,bookmarks,aichat,history,syncedtabs,passwords";\n'
+                ),
+                "modules/libpref/init/all.js": (
+                    'pref("extensions.ml.enabled", true);\n'
+                    'pref("browser.ai.control.default", "available");\n'
+                    'pref("browser.ml.enable", true);\n'
+                ),
+                "browser/app/profile/firefox.js": (
+                    'pref("browser.preferences.aiControls", true);\n'
+                    'pref("browser.ml.chat.enabled", true);\n'
+                    'pref("browser.tabs.groups.smart.enabled", true);\n'
+                ),
+                "modules/libpref/init/StaticPrefList.yaml": (
+                    "- name: browser.smartwindow.aitab.enabled\n"
+                    "  type: bool\n"
+                    "  value: @IS_NIGHTLY_BUILD@\n"
+                ),
+            }
+            for rel, content in files.items():
+                p = ff / rel
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(content, encoding="utf-8")
+
+            self.assertEqual(len(apply_win7_patches.patch_chromium_sandbox_runtime_win7(ff, False)), 2)
+            self.assertEqual(len(apply_win7_patches.patch_ipc_and_networking_win7(ff, False)), 3)
+            self.assertEqual(len(apply_win7_patches.patch_win7_titlebar_icons(ff, False)), 1)
+            self.assertEqual(len(apply_win7_patches.patch_remove_ai_features(ff, False)), 6)
+
+            # Verify key outcomes
+            self.assertIn("WIN10_20H1", (ff / "security/sandbox/chromium/sandbox/win/src/process_mitigations.cc").read_text(encoding="utf-8"))
+            self.assertIn("ERROR_INVALID_PARAMETER", (ff / "security/sandbox/chromium/sandbox/win/src/startup_information_helper.cc").read_text(encoding="utf-8"))
+            self.assertIn("appContainersSupported", (ff / "ipc/mscom/ProcessRuntime.cpp").read_text(encoding="utf-8"))
+            self.assertIn("MozSharedMem_", (ff / "ipc/glue/SharedMemoryPlatform_windows.cpp").read_text(encoding="utf-8"))
+            self.assertIn('target_os = "windows"', (ff / "netwerk/socket/neqo_glue/src/lib.rs").read_text(encoding="utf-8"))
+
+            bcss = (ff / "browser/themes/windows/browser.css").read_text(encoding="utf-8")
+            self.assertIn("mask-image: url(\"data:image/svg+xml", bcss)
+            self.assertNotIn("\\e921", bcss)
+            self.assertNotIn("\\e8bb", bcss)
+
+            self.assertIn('hidden="true"', (ff / "browser/components/preferences/preferences.xhtml").read_text(encoding="utf-8"))
+            self.assertIn("visible: () => false,", (ff / "browser/components/preferences/preferences.js").read_text(encoding="utf-8"))
+            self.assertNotIn("aichat", (ff / "browser/components/sidebar/SidebarManager.sys.mjs").read_text(encoding="utf-8"))
+            self.assertIn('pref("browser.ai.control.default", "blocked");', (ff / "modules/libpref/init/all.js").read_text(encoding="utf-8"))
+            self.assertIn('pref("browser.preferences.aiControls", false);', (ff / "browser/app/profile/firefox.js").read_text(encoding="utf-8"))
+
+            # Verify branding prefs disable all AI controls & features
+            brand_prefs = (ROOT / "branding/konfox/pref/firefox-branding.js").read_text(encoding="utf-8")
+            self.assertIn('pref("browser.preferences.aiControls", false);', brand_prefs)
+            self.assertIn('pref("browser.ai.control.default", "blocked");', brand_prefs)
+            self.assertIn('pref("browser.ml.enable", false);', brand_prefs)
+            self.assertIn('pref("browser.ml.chat.enabled", false);', brand_prefs)
+
+            # Pass 2: 100% idempotent
+            self.assertEqual(apply_win7_patches.patch_chromium_sandbox_runtime_win7(ff, False), [])
+            self.assertEqual(apply_win7_patches.patch_ipc_and_networking_win7(ff, False), [])
+            self.assertEqual(apply_win7_patches.patch_win7_titlebar_icons(ff, False), [])
+            self.assertEqual(apply_win7_patches.patch_remove_ai_features(ff, False), [])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
