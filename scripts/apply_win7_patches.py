@@ -1398,8 +1398,143 @@ def patch_combase_and_agile_reference(firefox_dir: Path, dry_run: bool) -> list[
             wc_changed.append("src/imp/marshaler.rs")
             touched.append(str(marshaler_rs.relative_to(firefox_dir)))
 
+    com_bindings_rs = wc_dir / "src/imp/com_bindings.rs"
+    if com_bindings_rs.is_file():
+        orig = com_bindings_rs.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        if "[Könfox Win7]" not in patched and 'link!("combase.dll"' in patched:
+            old_agile_rs = (
+                '    windows_core::link!("combase.dll" "system" fn RoGetAgileReference(options : AgileReferenceOptions, riid : *const windows_core::GUID, punk : * mut core::ffi::c_void, ppagilereference : *mut * mut core::ffi::c_void) -> windows_core::HRESULT);\n'
+                "    unsafe {\n"
+                "        let mut result__ = core::mem::zeroed();\n"
+                "        RoGetAgileReference(options, riid, punk.param().abi(), &mut result__)\n"
+                "            .and_then(|| windows_core::Type::from_abi(result__))\n"
+                "    }"
+            )
+            new_agile_rs = (
+                "    // [Könfox Win7] Dynamically resolve combase.dll!RoGetAgileReference (Win8.1+)\n"
+                "    // so windows-core never emits a static combase.dll import on Windows 7 SP1.\n"
+                "    unsafe {\n"
+                '        let module = super::LoadLibraryExA(b"combase.dll\\0".as_ptr(), core::ptr::null_mut(), 0);\n'
+                "        if module.is_null() {\n"
+                "            return Err(windows_core::HRESULT(-2147467263i32).into());\n"
+                "        }\n"
+                '        if let Some(addr) = super::GetProcAddress(module, b"RoGetAgileReference\\0".as_ptr()) {\n'
+                '            let f: unsafe extern "system" fn(\n'
+                "                AgileReferenceOptions,\n"
+                "                *const windows_core::GUID,\n"
+                "                *mut core::ffi::c_void,\n"
+                "                *mut *mut core::ffi::c_void,\n"
+                "            ) -> windows_core::HRESULT = core::mem::transmute(addr);\n"
+                "            let mut result__ = core::mem::zeroed();\n"
+                "            return f(options, riid, punk.param().abi(), &mut result__)\n"
+                "                .and_then(|| windows_core::Type::from_abi(result__));\n"
+                "        }\n"
+                "        Err(windows_core::HRESULT(-2147467263i32).into())\n"
+                "    }"
+            )
+            if old_agile_rs in patched:
+                patched = patched.replace(old_agile_rs, new_agile_rs, 1)
+        if patched != orig:
+            if not dry_run:
+                com_bindings_rs.write_text(patched, encoding="utf-8")
+            wc_changed.append("src/imp/com_bindings.rs")
+            touched.append(str(com_bindings_rs.relative_to(firefox_dir)))
+
     if wc_changed and _refresh_cargo_checksum(wc_dir, wc_changed, dry_run):
         touched.append(str((wc_dir / ".cargo-checksum.json").relative_to(firefox_dir)))
+
+    # --- 17a2. third_party/rust/windows-link ---
+    # windows-core re-exports `windows_link::link!`, which is also invoked by the
+    # bootstrapped `~/.mozbuild/windows-rs` (`windows 0.62.2`) crate via
+    # `build/rust/windows/src/lib.rs` (`mozbuild::windows_rs_lib!{}`).
+    # Redirecting `"combase.dll"` -> `"ole32.dll"` inside `windows_link::link!`
+    # guarantees ZERO Rust crates (vendored OR bootstrapped) ever emit raw-dylib
+    # `combase.dll` import stubs into `gkrust.lib` / `xul.dll`.
+    wl_dir = firefox_dir / "third_party/rust/windows-link"
+    wl_lib_rs = wl_dir / "src/lib.rs"
+    if wl_lib_rs.is_file():
+        orig = wl_lib_rs.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        if "[Könfox Win7]" not in patched:
+            old_x86 = (
+                "#[cfg(all(windows, target_arch = \"x86\"))]\n"
+                "#[macro_export]\n"
+                "macro_rules! link {\n"
+                "    ($library:literal $abi:literal $($link_name:literal)? fn $($function:tt)*) => (\n"
+                '        #[link(name = $library, kind = "raw-dylib", modifiers = "+verbatim", import_name_type = "undecorated")]\n'
+                "        extern $abi {\n"
+                "            $(#[link_name=$link_name])?\n"
+                "            pub fn $($function)*;\n"
+                "        }\n"
+                "    )\n"
+                "}"
+            )
+            new_x86 = (
+                "#[cfg(all(windows, target_arch = \"x86\"))]\n"
+                "#[macro_export]\n"
+                "macro_rules! link {\n"
+                "    // [Könfox Win7] Redirect combase.dll (Win8+) raw-dylib links to ole32.dll (Win7-native).\n"
+                '    ("combase.dll" $abi:literal $($link_name:literal)? fn $($function:tt)*) => (\n'
+                '        #[link(name = "ole32.dll", kind = "raw-dylib", modifiers = "+verbatim", import_name_type = "undecorated")]\n'
+                "        extern $abi {\n"
+                "            $(#[link_name=$link_name])?\n"
+                "            pub fn $($function)*;\n"
+                "        }\n"
+                "    );\n"
+                "    ($library:literal $abi:literal $($link_name:literal)? fn $($function:tt)*) => (\n"
+                '        #[link(name = $library, kind = "raw-dylib", modifiers = "+verbatim", import_name_type = "undecorated")]\n'
+                "        extern $abi {\n"
+                "            $(#[link_name=$link_name])?\n"
+                "            pub fn $($function)*;\n"
+                "        }\n"
+                "    );\n"
+                "}"
+            )
+            old_x64 = (
+                "#[cfg(all(windows, not(target_arch = \"x86\")))]\n"
+                "#[macro_export]\n"
+                "macro_rules! link {\n"
+                "    ($library:literal $abi:literal $($link_name:literal)? fn $($function:tt)*) => (\n"
+                '        #[link(name = $library, kind = "raw-dylib", modifiers = "+verbatim")]\n'
+                "        extern $abi {\n"
+                "            $(#[link_name=$link_name])?\n"
+                "            pub fn $($function)*;\n"
+                "        }\n"
+                "    )\n"
+                "}"
+            )
+            new_x64 = (
+                "#[cfg(all(windows, not(target_arch = \"x86\")))]\n"
+                "#[macro_export]\n"
+                "macro_rules! link {\n"
+                "    // [Könfox Win7] Redirect combase.dll (Win8+) raw-dylib links to ole32.dll (Win7-native).\n"
+                '    ("combase.dll" $abi:literal $($link_name:literal)? fn $($function:tt)*) => (\n'
+                '        #[link(name = "ole32.dll", kind = "raw-dylib", modifiers = "+verbatim")]\n'
+                "        extern $abi {\n"
+                "            $(#[link_name=$link_name])?\n"
+                "            pub fn $($function)*;\n"
+                "        }\n"
+                "    );\n"
+                "    ($library:literal $abi:literal $($link_name:literal)? fn $($function:tt)*) => (\n"
+                '        #[link(name = $library, kind = "raw-dylib", modifiers = "+verbatim")]\n'
+                "        extern $abi {\n"
+                "            $(#[link_name=$link_name])?\n"
+                "            pub fn $($function)*;\n"
+                "        }\n"
+                "    );\n"
+                "}"
+            )
+            if old_x86 in patched:
+                patched = patched.replace(old_x86, new_x86, 1)
+            if old_x64 in patched:
+                patched = patched.replace(old_x64, new_x64, 1)
+        if patched != orig:
+            if not dry_run:
+                wl_lib_rs.write_text(patched, encoding="utf-8")
+            touched.append(str(wl_lib_rs.relative_to(firefox_dir)))
+            if _refresh_cargo_checksum(wl_dir, ["src/lib.rs"], dry_run):
+                touched.append(str((wl_dir / ".cargo-checksum.json").relative_to(firefox_dir)))
 
     # --- 17b. third_party/rust/windows-sys ---
     ws_dir = firefox_dir / "third_party/rust/windows-sys"
@@ -2657,6 +2792,38 @@ def patch_memory_tracker_win7(firefox_dir: Path, dry_run: bool) -> list[str]:
     return touched
 
 
+def patch_bootstrapped_windows_rs(windows_rs_dir: Path, dry_run: bool) -> list[str]:
+    """
+    Belt-and-suspenders patch for Mozilla's bootstrapped `~/.mozbuild/windows-rs`
+    crate (`windows 0.62.2`, compiled via `build/rust/windows/src/lib.rs`).
+    Rewrites `combase.dll` raw-dylib links for Win7-native COM functions
+    (`CoCreateFreeThreadedMarshaler`, `CoTaskMemAlloc`, `CoTaskMemFree`) to
+    `ole32.dll` directly in the bootstrapped source tree.
+    """
+    touched: list[str] = []
+    if not windows_rs_dir.is_dir():
+        return touched
+
+    com_mod = windows_rs_dir / "src/Windows/Win32/System/Com/mod.rs"
+    if com_mod.is_file():
+        orig = com_mod.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        for sym in ("CoCreateFreeThreadedMarshaler", "CoTaskMemAlloc", "CoTaskMemFree"):
+            patched = patched.replace(
+                f'windows_core::link!("combase.dll" "system" fn {sym}(',
+                f'windows_core::link!("ole32.dll" "system" fn {sym}(',
+            )
+            patched = patched.replace(
+                f'windows_link::link!("combase.dll" "system" fn {sym}(',
+                f'windows_link::link!("ole32.dll" "system" fn {sym}(',
+            )
+        if patched != orig:
+            if not dry_run:
+                com_mod.write_text(patched, encoding="utf-8")
+            touched.append(str(com_mod))
+    return touched
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Apply Könfox Windows 7 SP1 x64 patches to a Firefox Nightly checkout."
@@ -2668,8 +2835,24 @@ def main() -> int:
         default=Path(__file__).resolve().parent.parent / "patches",
         help="Directory containing patches/series and extra .patch/.diff files",
     )
+    parser.add_argument(
+        "--patch-windows-rs",
+        type=Path,
+        default=None,
+        help="Only patch Mozilla's bootstrapped ~/.mozbuild/windows-rs directory and exit",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Check only; do not write files")
     args = parser.parse_args()
+
+    if args.patch_windows_rs is not None:
+        touched = patch_bootstrapped_windows_rs(args.patch_windows_rs, args.dry_run)
+        if touched:
+            print(f"[konfox-patches] Bootstrapped windows-rs combase->ole32: {len(touched)} change(s)")
+            for item in touched:
+                print(f"  - {item}")
+        else:
+            print("[konfox-patches] Bootstrapped windows-rs combase->ole32: up to date / no changes needed")
+        return 0
 
     if not (args.firefox_dir / "mach").is_file():
         raise FileNotFoundError(f"{args.firefox_dir} does not look like a Firefox source tree (missing mach)")

@@ -317,6 +317,14 @@ stage_build() {
         rm -rf "${MOZBUILD_DIR}/toolchains"
     fi
 
+    # Belt-and-suspenders: patch bootstrapped ~/.mozbuild/windows-rs (downloaded by
+    # ./mach configure) so CoCreateFreeThreadedMarshaler/CoTaskMemAlloc/CoTaskMemFree
+    # link ole32.dll in addition to the universal redirect in windows-link/src/lib.rs.
+    if [[ -d "${MOZBUILD_DIR}/windows-rs" ]]; then
+        python3 "${ROOT_DIR}/scripts/apply_win7_patches.py" \
+            --patch-windows-rs "${MOZBUILD_DIR}/windows-rs" "$FIREFOX_DIR"
+    fi
+
     ./mach build
     popd >/dev/null
 }

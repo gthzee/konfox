@@ -579,6 +579,38 @@ class KonfoxToolchainTests(unittest.TestCase):
                 "third_party/rust/windows-core/src/imp/marshaler.rs": (
                     'windows_link::link!("combase.dll" "system" fn CoCreateFreeThreadedMarshaler(punkouter: *mut c_void, ppunkmarshal: *mut *mut c_void) -> HRESULT);\n'
                 ),
+                "third_party/rust/windows-core/src/imp/com_bindings.rs": (
+                    '    windows_core::link!("combase.dll" "system" fn RoGetAgileReference(options : AgileReferenceOptions, riid : *const windows_core::GUID, punk : * mut core::ffi::c_void, ppagilereference : *mut * mut core::ffi::c_void) -> windows_core::HRESULT);\n'
+                    "    unsafe {\n"
+                    "        let mut result__ = core::mem::zeroed();\n"
+                    "        RoGetAgileReference(options, riid, punk.param().abi(), &mut result__)\n"
+                    "            .and_then(|| windows_core::Type::from_abi(result__))\n"
+                    "    }\n"
+                ),
+                "third_party/rust/windows-link/src/lib.rs": (
+                    '#[cfg(all(windows, target_arch = "x86"))]\n'
+                    "#[macro_export]\n"
+                    "macro_rules! link {\n"
+                    "    ($library:literal $abi:literal $($link_name:literal)? fn $($function:tt)*) => (\n"
+                    '        #[link(name = $library, kind = "raw-dylib", modifiers = "+verbatim", import_name_type = "undecorated")]\n'
+                    "        extern $abi {\n"
+                    "            $(#[link_name=$link_name])?\n"
+                    "            pub fn $($function)*;\n"
+                    "        }\n"
+                    "    )\n"
+                    "}\n\n"
+                    '#[cfg(all(windows, not(target_arch = "x86")))]\n'
+                    "#[macro_export]\n"
+                    "macro_rules! link {\n"
+                    "    ($library:literal $abi:literal $($link_name:literal)? fn $($function:tt)*) => (\n"
+                    '        #[link(name = $library, kind = "raw-dylib", modifiers = "+verbatim")]\n'
+                    "        extern $abi {\n"
+                    "            $(#[link_name=$link_name])?\n"
+                    "            pub fn $($function)*;\n"
+                    "        }\n"
+                    "    )\n"
+                    "}\n"
+                ),
                 "third_party/rust/windows-sys/src/Windows/Win32/System/Com/mod.rs": (
                     'windows_link::link!("combase.dll" "system" fn CoTaskMemAlloc(cb : usize) -> *mut core::ffi::c_void);\n'
                 ),
@@ -672,16 +704,29 @@ class KonfoxToolchainTests(unittest.TestCase):
                 p.write_text(content, encoding="utf-8")
 
             for crate, rels in (
-                ("third_party/rust/windows-core", ["src/imp/bindings.rs", "src/imp/marshaler.rs"]),
+                ("third_party/rust/windows-core", ["src/imp/bindings.rs", "src/imp/marshaler.rs", "src/imp/com_bindings.rs"]),
+                ("third_party/rust/windows-link", ["src/lib.rs"]),
                 ("third_party/rust/windows-sys", ["src/Windows/Win32/System/Com/mod.rs"]),
             ):
                 cdir = ff / crate
                 ck = {r: hashlib.sha256((cdir / r).read_bytes()).hexdigest() for r in rels}
                 (cdir / ".cargo-checksum.json").write_text(json.dumps({"files": ck}), encoding="utf-8")
 
+            # Seed a mock bootstrapped ~/.mozbuild/windows-rs directory too
+            winrs = Path(tmp) / "windows-rs"
+            winrs_com = winrs / "src/Windows/Win32/System/Com/mod.rs"
+            winrs_com.parent.mkdir(parents=True, exist_ok=True)
+            winrs_com.write_text(
+                'windows_core::link!("combase.dll" "system" fn CoCreateFreeThreadedMarshaler(a: *mut core::ffi::c_void));\n'
+                'windows_core::link!("combase.dll" "system" fn CoTaskMemAlloc(cb: usize) -> *mut core::ffi::c_void);\n'
+                'windows_core::link!("combase.dll" "system" fn CoTaskMemFree(pv: *const core::ffi::c_void));\n',
+                encoding="utf-8",
+            )
+
             # Pass 1: apply every new step
             self.assertEqual(len(apply_win7_patches.patch_konfox_app_manifest(ff, False)), 1)
-            self.assertEqual(len(apply_win7_patches.patch_combase_and_agile_reference(ff, False)), 6)
+            self.assertEqual(len(apply_win7_patches.patch_combase_and_agile_reference(ff, False)), 9)
+            self.assertEqual(len(apply_win7_patches.patch_bootstrapped_windows_rs(winrs, False)), 1)
             self.assertEqual(len(apply_win7_patches.patch_jit_unwind_win7(ff, False)), 1)
             self.assertEqual(len(apply_win7_patches.patch_aumid_dynamic_load(ff, False)), 2)
             self.assertEqual(len(apply_win7_patches.patch_win7_prng_fallbacks(ff, False)), 2)
@@ -692,6 +737,9 @@ class KonfoxToolchainTests(unittest.TestCase):
             # Verify outputs
             self.assertIn('name="Konfox"', (ff / "browser/app/konfox.exe.manifest").read_text())
             self.assertNotIn('link!("combase.dll"', (ff / "third_party/rust/windows-core/src/imp/bindings.rs").read_text())
+            self.assertNotIn('link!("combase.dll"', (ff / "third_party/rust/windows-core/src/imp/com_bindings.rs").read_text())
+            self.assertIn('name = "ole32.dll"', (ff / "third_party/rust/windows-link/src/lib.rs").read_text())
+            self.assertNotIn('link!("combase.dll"', winrs_com.read_text())
             self.assertIn("GitAgileReference", (ff / "ipc/mscom/AgileReference.cpp").read_text())
             self.assertIn("RtlInstallFunctionTableCallback", (ff / "js/src/jit/ProcessExecutableMemory.cpp").read_text())
             self.assertNotIn("GetCurrentApplicationUserModelId(", (ff / "widget/windows/ToastNotification.cpp").read_text())
@@ -703,6 +751,7 @@ class KonfoxToolchainTests(unittest.TestCase):
             # Pass 2: all steps must be 100% idempotent
             self.assertEqual(apply_win7_patches.patch_konfox_app_manifest(ff, False), [])
             self.assertEqual(apply_win7_patches.patch_combase_and_agile_reference(ff, False), [])
+            self.assertEqual(apply_win7_patches.patch_bootstrapped_windows_rs(winrs, False), [])
             self.assertEqual(apply_win7_patches.patch_jit_unwind_win7(ff, False), [])
             self.assertEqual(apply_win7_patches.patch_aumid_dynamic_load(ff, False), [])
             self.assertEqual(apply_win7_patches.patch_win7_prng_fallbacks(ff, False), [])
