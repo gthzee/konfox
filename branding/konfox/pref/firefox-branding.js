@@ -28,6 +28,10 @@ pref("app.update.badgeWaitTime", 0);
 // Keep Nightly developer ergonomics.
 pref("devtools.selfxss.count", 5);
 
+// Windows 7 SP1 networking reliability: disable Nightly-only experimental
+// WinRegistry/WinINet proxy change watcher (OFF in Firefox Release/ESR).
+pref("network.proxy.detect_system_proxy_changes", false);
+
 // ---------------------------------------------------------------------------
 // Könfox: Completely disable all AI / ML / GenAI features and "AI Controls" UI
 // ---------------------------------------------------------------------------

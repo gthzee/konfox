@@ -1069,6 +1069,223 @@ class KonfoxToolchainTests(unittest.TestCase):
             self.assertEqual(apply_win7_patches.patch_winrt_and_widget_win7(ff, False), [])
             self.assertEqual(apply_win7_patches.patch_ipc_and_networking_win7(ff, False), [])
 
+    def test_run14_win7_winrt_sandbox_loader_net_fixes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ff = Path(tmp)
+            files = {
+                "third_party/rust/windows-core/src/imp/bindings.rs": (
+                    'windows_link::link!("combase.dll" "system" fn CoIncrementMTAUsage(pcookie : *mut CO_MTA_USAGE_COOKIE) -> HRESULT);\n'
+                    'windows_link::link!("combase.dll" "system" fn CoTaskMemAlloc(cb : usize) -> *mut core::ffi::c_void);\n'
+                    'windows_link::link!("combase.dll" "system" fn CoTaskMemFree(pv : *const core::ffi::c_void));\n'
+                    'windows_link::link!("api-ms-win-core-winrt-l1-1-0.dll" "system" fn RoGetActivationFactory(activatableclassid : HSTRING, iid : *const GUID, factory : *mut *mut core::ffi::c_void) -> HRESULT);\n'
+                ),
+                "third_party/rust/windows-core/.cargo-checksum.json": (
+                    '{"files":{"src/imp/bindings.rs":"0000"},"package":null}'
+                ),
+                "security/sandbox/chromium/sandbox/win/src/window.cc": (
+                    '#include "base/win/security_descriptor.h"\n'
+                    "  if (sd->dacl() && sd->dacl()->is_null()) {\n"
+                    "    sd->SetDaclEntry(base::win::WellKnownSid::kAllApplicationPackages,\n"
+                    "                     base::win::SecurityAccessMode::kGrant, GENERIC_ALL, 0);\n"
+                    "  }\n"
+                ),
+                "security/sandbox/win/src/sandboxbroker/sandboxBroker.cpp": (
+                    "static sandbox::ResultCode AddWin32kLockdownConfig(\n"
+                    "    sandbox::TargetConfig* aConfig) {\n"
+                    "  return sandbox::SBOX_ALL_OK;\n"
+                    "}\n"
+                    "static sandbox::ResultCode AddCigToConfig(\n"
+                    "    sandbox::TargetConfig* aConfig, bool aAlwaysProxyBinDirLoading = false) {\n"
+                    "  return sandbox::SBOX_ALL_OK;\n"
+                    "}\n"
+                    "void SandboxBroker::SetSecurityLevelForContentProcess(int32_t aSandboxLevel, bool aIsFileProcess) {\n"
+                    "  MOZ_RELEASE_ASSERT(aSandboxLevel >= 1,\n"
+                    '                     "Should not be called with aSandboxLevel < 1");\n'
+                    "  // Add the policy for the client side of the crash server pipe.\n"
+                    "  result = config->AllowFileAccess(sandbox::FileSemantics::kAllowAny,\n"
+                    '                                   L"\\\\??\\\\pipe\\\\gecko-crash-server-pipe.*");\n'
+                    "}\n"
+                    "void SandboxBroker::SetSecurityLevelForGPUProcess(int32_t aSandboxLevel) {\n"
+                    "  if (aSandboxLevel >= 2) {\n"
+                    "    if (UseFontFileRule()) {\n"
+                    "    }\n"
+                    "  }\n"
+                    "}\n"
+                    "bool SandboxBroker::SetSecurityLevelForGMPlugin(GMPSandboxKind aGMPSandboxKind) {\n"
+                    "  if (StaticPrefs::security_sandbox_gmp_win32k_disable() &&\n"
+                    "      aGMPSandboxKind != Widevine && aGMPSandboxKind != Clearkey &&\n"
+                    "      aGMPSandboxKind != Fake) {\n"
+                    "    return true;\n"
+                    "  }\n"
+                    "  return true;\n"
+                    "}\n"
+                ),
+                "security/sandbox/chromium/sandbox/win/src/target_process.cc": (
+                    '#include "base/win/current_module.h"\n'
+                    "  if (startup_info->has_extended_startup_info())\n"
+                    "    flags |= EXTENDED_STARTUPINFO_PRESENT;\n"
+                ),
+                "security/sandbox/chromium/sandbox/win/src/win_utils.cc": (
+                    "decltype(&ProcessPrng) GetProcessPrng() {\n"
+                    '  HMODULE hmod = LoadLibraryW(L"bcryptprimitives.dll");\n'
+                    "  CHECK(hmod);\n"
+                    "  decltype(&ProcessPrng) process_prng_fn =\n"
+                    "      reinterpret_cast<decltype(&ProcessPrng)>(\n"
+                    '          GetProcAddress(hmod, "ProcessPrng"));\n'
+                    "  CHECK(process_prng_fn);\n"
+                    "  return process_prng_fn;\n"
+                    "}\n"
+                ),
+                "security/sandbox/chromium/base/win/win_util.cc": (
+                    "    PROCESS_MITIGATION_SYSTEM_CALL_DISABLE_POLICY policy = {};\n"
+                    "    if (::GetProcessMitigationPolicy(GetCurrentProcess(),\n"
+                    "                                     ProcessSystemCallDisablePolicy, &policy,\n"
+                    "                                     sizeof(policy))) {\n"
+                    "      return policy.DisallowWin32kSystemCalls == 0;\n"
+                    "    }\n"
+                ),
+                "security/sandbox/chromium/base/threading/platform_thread_win.cc": (
+                    "    [[maybe_unused]] const BOOL memory_priority_success =\n"
+                    "        SetThreadInformation(platform_handle, ::ThreadMemoryPriority,\n"
+                    "                             &memory_priority, sizeof(memory_priority));\n"
+                    "  [[maybe_unused]] const BOOL success = ::SetThreadInformation(\n"
+                    "      thread_handle.platform_handle(), ::ThreadPowerThrottling,\n"
+                    "      &thread_power_throttling_state, sizeof(thread_power_throttling_state));\n"
+                ),
+                "browser/components/shell/rust/shell_windows/src/taskbar/shortcut.rs": (
+                    "use windows::{\n"
+                    "    core::{Error as WinError, Interface, PCWSTR},\n"
+                    "    Storage::UserDataPaths,\n"
+                    "    Win32::{\n"
+                    "        Foundation::{E_FAIL, MAX_PATH},\n"
+                    "        Storage::{\n"
+                    "            EnhancedStorage::PKEY_AppUserModel_ID,\n"
+                    "            Packaging::Appx::APPLICATION_USER_MODEL_ID_MAX_LENGTH,\n"
+                    "        },\n"
+                    "        System::Com::{\n"
+                    "            CoCreateInstance, IPersistFile,\n"
+                    "            StructuredStorage::{PropVariantClear, PropVariantToString},\n"
+                    "            CLSCTX_INPROC_SERVER, STGM,\n"
+                    "        },\n"
+                    "        UI::Shell::{IShellLinkW, PropertiesSystem::IPropertyStore, ShellLink as ShellLinkClsid},\n"
+                    "    },\n"
+                    "};\n"
+                    "    let appdata_folder = UserDataPaths::GetDefault()\n"
+                    "        .and_then(|paths| paths.RoamingAppData())\n"
+                    "        .map(|path| PathBuf::from(path.to_os_string()))\n"
+                    "        .map_err(IsPinnedError::GetAppData)?;\n"
+                    "        let mut aumid = [0u16; APPLICATION_USER_MODEL_ID_MAX_LENGTH as usize];\n"
+                    "        // SAFETY: `propvar` pointer derived from a reference.\n"
+                    "        unsafe { PropVariantToString(&*pv, &mut aumid) }?;\n\n"
+                    "        // Strip the trailing nulls, including the null terminator.\n"
+                    "        let aumid = aumid.split(|&c| c == 0).next().unwrap_or(&[]);\n"
+                ),
+                "browser/components/migration/MSMigrationUtils.sys.mjs": (
+                    'import { ctypes } from "resource://gre/modules/ctypes.sys.mjs";\n'
+                    "  get exists() {\n"
+                    "    // check if there are passwords available for migration.\n"
+                    "    return this.migrate(() => {}, true);\n"
+                    "  },\n"
+                ),
+                "xpcom/base/nsWindowsHelpers.h": (
+                    "HMODULE inline LoadLibrarySystem32(LPCWSTR aModule) {\n"
+                    "  return LoadLibraryExW(aModule, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);\n"
+                    "}\n"
+                ),
+                "browser/app/nsBrowserApp.cpp": (
+                    '  ::LoadLibraryExW(L"cryptbase.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);\n'
+                ),
+                "xpcom/threads/TimerThreadMonitor_windows.cpp": (
+                    '#include "mozilla/Assertions.h"\n'
+                    "      mHiResTimer(CreateWaitableTimerEx(nullptr, nullptr,\n"
+                    "                                        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,\n"
+                    "                                        TIMER_ALL_ACCESS)),\n"
+                    "      mLoResTimer(CreateWaitableTimerEx(nullptr, nullptr, 0, TIMER_ALL_ACCESS)),\n"
+                    "  [[maybe_unused]] const BOOL ok = SetWaitableTimerEx(\n"
+                    "      timer, &dueTime, 0, nullptr, nullptr, nullptr, timerTolerance);\n"
+                ),
+                "toolkit/xre/nsAppRunner.cpp": (
+                    '#  include "mozilla/WindowsDllBlocklist.h"\n'
+                    "#  if defined(MOZ_SANDBOX)\n"
+                    "  mAppData->sandboxBrokerServices = aConfig.sandboxBrokerServices;\n"
+                    "#  endif  // defined(MOZ_SANDBOX)\n"
+                ),
+                "third_party/rust/quinn-udp/src/windows.rs": (
+                    "        let v6only = unsafe {\n"
+                    "            get_socket_option::<u32>(&*socket.0, WinSock::IPPROTO_IPV6, WinSock::IPV6_V6ONLY as _)\n"
+                    "        }?;\n"
+                    "                    if code == WinSock::WSAENOPROTOOPT\n"
+                    "                    || code == WinSock::WSAEOPNOTSUPP\n"
+                    "            set_socket_option(\n"
+                    "                &*socket.0,\n"
+                    "                WinSock::IPPROTO_IPV6,\n"
+                    "                WinSock::IPV6_DONTFRAG,\n"
+                    "                OPTION_ON,\n"
+                    "            )?;\n"
+                    "            max_gso_segments: AtomicUsize::new(max_gso_segments(&*socket.0)),\n"
+                    "    pub fn gro_segments(&self) -> usize {\n"
+                    "        // Arbitrary reasonable value inspired by Linux and msquic\n"
+                    "        64\n"
+                    "    }\n"
+                ),
+                "third_party/rust/quinn-udp/.cargo-checksum.json": (
+                    '{"files":{"src/windows.rs":"0000"},"package":null}'
+                ),
+            }
+            for rel, content in files.items():
+                p = ff / rel
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(content, encoding="utf-8")
+
+            self.assertEqual(len(apply_win7_patches.patch_combase_and_agile_reference(ff, False)), 2)
+            self.assertEqual(len(apply_win7_patches.patch_chromium_sandbox_runtime_win7(ff, False)), 6)
+            self.assertEqual(len(apply_win7_patches.patch_winrt_and_widget_win7(ff, False)), 6)
+            self.assertEqual(len(apply_win7_patches.patch_ipc_and_networking_win7(ff, False)), 1)
+
+            bindings = (ff / "third_party/rust/windows-core/src/imp/bindings.rs").read_text(encoding="utf-8")
+            self.assertIn("pub unsafe fn RoGetActivationFactory", bindings)
+            self.assertNotIn('link!("api-ms-win-core-winrt-l1-1-0.dll"', bindings)
+            wc_cs = json.loads((ff / "third_party/rust/windows-core/.cargo-checksum.json").read_text(encoding="utf-8"))
+            self.assertNotEqual(wc_cs["files"]["src/imp/bindings.rs"], "0000")
+
+            self.assertIn("ALL APPLICATION PACKAGES SID", (ff / "security/sandbox/chromium/sandbox/win/src/window.cc").read_text(encoding="utf-8"))
+            sb = (ff / "security/sandbox/win/src/sandboxbroker/sandboxBroker.cpp").read_text(encoding="utf-8")
+            self.assertIn("aSandboxLevel = 6;", sb)
+            self.assertIn(r'\Device\KsecDD', sb)
+            self.assertIn("FOLDERID_Fonts", sb)
+            self.assertIn("CREATE_BREAKAWAY_FROM_JOB", (ff / "security/sandbox/chromium/sandbox/win/src/target_process.cc").read_text(encoding="utf-8"))
+            self.assertIn("KonfoxRtlGenRandomAdapter", (ff / "security/sandbox/chromium/sandbox/win/src/win_utils.cc").read_text(encoding="utf-8"))
+            self.assertIn("pGetProcessMitigationPolicy", (ff / "security/sandbox/chromium/base/win/win_util.cc").read_text(encoding="utf-8"))
+            self.assertEqual((ff / "security/sandbox/chromium/base/threading/platform_thread_win.cc").read_text(encoding="utf-8").count("pSetThreadInformation"), 6)
+
+            sc = (ff / "browser/components/shell/rust/shell_windows/src/taskbar/shortcut.rs").read_text(encoding="utf-8")
+            self.assertIn("SHGetFolderPathW(", sc)
+            self.assertNotIn("UserDataPaths::", sc)
+            self.assertIn("VT_LPWSTR", sc)
+            self.assertIn('isPlatformAndVersionAtLeast("win", "6.2")', (ff / "browser/components/migration/MSMigrationUtils.sys.mjs").read_text(encoding="utf-8"))
+            self.assertIn("ConstructSystem32Path", (ff / "xpcom/base/nsWindowsHelpers.h").read_text(encoding="utf-8"))
+            self.assertIn('::LoadLibraryW(L"cryptbase.dll");', (ff / "browser/app/nsBrowserApp.cpp").read_text(encoding="utf-8"))
+            self.assertIn("CreateWaitableTimerW(nullptr, FALSE, nullptr)", (ff / "xpcom/threads/TimerThreadMonitor_windows.cpp").read_text(encoding="utf-8"))
+            self.assertIn("mozilla::RandomUint64OrDie()", (ff / "toolkit/xre/nsAppRunner.cpp").read_text(encoding="utf-8"))
+
+            qu = (ff / "third_party/rust/quinn-udp/src/windows.rs").read_text(encoding="utf-8")
+            self.assertIn("let v6only = if is_ipv6 {", qu)
+            self.assertIn("if !is_ecn_unsupported(&e)", qu)
+            self.assertIn("Windows 7 does not support UDP GRO.", qu)
+
+            # Branding pref check
+            branding_js = (
+                Path(__file__).resolve().parent.parent
+                / "branding/konfox/pref/firefox-branding.js"
+            ).read_text(encoding="utf-8")
+            self.assertIn('pref("network.proxy.detect_system_proxy_changes", false);', branding_js)
+
+            # Pass 2: 100% idempotent
+            self.assertEqual(apply_win7_patches.patch_combase_and_agile_reference(ff, False), [])
+            self.assertEqual(apply_win7_patches.patch_chromium_sandbox_runtime_win7(ff, False), [])
+            self.assertEqual(apply_win7_patches.patch_winrt_and_widget_win7(ff, False), [])
+            self.assertEqual(apply_win7_patches.patch_ipc_and_networking_win7(ff, False), [])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
