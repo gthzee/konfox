@@ -2526,6 +2526,48 @@ def patch_chromium_sandbox_runtime_win7(firefox_dir: Path, dry_run: bool) -> lis
         orig = sb_cpp.read_text(encoding="utf-8", errors="replace")
         patched = orig
         if "[Könfox Win7]" not in patched:
+            # CRITICAL Win7 child-process fix:
+            # Skip InitDllBlocklistOOP AND RestoreImportDirectory when the
+            # Win10+ launcher process is disabled or on Windows 7. On Win7 x64,
+            # DllBlocklistInit.cpp:58 (NtMapViewOfSection cross-process detour)
+            # fails with INTERCEPTOR_MOD_INACCESSIBLE and sandboxBroker.cpp:622
+            # calls TerminateProcess(targetInfo.hProcess, 1), killing every tab
+            # and utility child process on spawn!
+            patched = patched.replace(
+                "#ifdef MOZ_THUNDERBIRD\n"
+                "  // In Thunderbird, mInitDllBlocklistOOP is null, so InitDllBlocklistOOP would\n"
+                "  // hit MOZ_RELEASE_ASSERT.\n"
+                "  constexpr bool isThunderbird = true;\n"
+                "#else\n"
+                "  constexpr bool isThunderbird = false;\n"
+                "#endif\n\n"
+                "  if (!isThunderbird &&\n"
+                "      XRE_GetChildProcBinPathType(aProcessType) == BinPathType::Self) {\n",
+                (
+                    "#if defined(MOZ_THUNDERBIRD) || !defined(MOZ_LAUNCHER_PROCESS)\n"
+                    "  // [Könfox Win7] Skip out-of-process DLL blocklist & IAT rewrite when\n"
+                    "  // launcher process is disabled or on Windows 7 (avoids Win7 ntdll\n"
+                    "  // INTERCEPTOR_MOD_INACCESSIBLE fatal TerminateProcess on child spawn).\n"
+                    "  constexpr bool isThunderbird = true;\n"
+                    "#else\n"
+                    "  const bool isThunderbird = !mozilla::IsWin8OrLater();\n"
+                    "#endif\n\n"
+                    "  if (mozilla::IsWin8OrLater() && !isThunderbird &&\n"
+                    "      XRE_GetChildProcBinPathType(aProcessType) == BinPathType::Self) {\n"
+                ),
+                1,
+            )
+            patched = patched.replace(
+                "  } else {\n"
+                "    // Load the child executable as a datafile so that we can examine its\n"
+                "    // headers without doing a full load with dependencies and such.\n",
+                (
+                    "  } else if (mozilla::IsWin8OrLater() && !isThunderbird) {\n"
+                    "    // Load the child executable as a datafile so that we can examine its\n"
+                    "    // headers without doing a full load with dependencies and such.\n"
+                ),
+                1,
+            )
             patched = patched.replace(
                 "static sandbox::ResultCode AddWin32kLockdownConfig(\n"
                 "    sandbox::TargetConfig* aConfig) {\n",
@@ -2572,6 +2614,8 @@ def patch_chromium_sandbox_runtime_win7(firefox_dir: Path, dry_run: bool) -> lis
                 ),
                 1,
             )
+            # Grant \Device\KsecDD on Win7 for ALL sandboxed process types
+            # (Content, RDD, Utility, GMP) — replace every occurrence.
             patched = patched.replace(
                 "  // Add the policy for the client side of the crash server pipe.\n"
                 "  result = config->AllowFileAccess(sandbox::FileSemantics::kAllowAny,\n"
@@ -2585,6 +2629,43 @@ def patch_chromium_sandbox_runtime_win7(firefox_dir: Path, dry_run: bool) -> lis
                     "  // Add the policy for the client side of the crash server pipe.\n"
                     "  result = config->AllowFileAccess(sandbox::FileSemantics::kAllowAny,\n"
                     '                                   L"\\\\??\\\\pipe\\\\gecko-crash-server-pipe.*");\n'
+                ),
+            )
+            # Utility sandbox: cap Win7 delayed token & integrity to USER_LIMITED + LOW
+            # (Win10 defaults to USER_LOCKDOWN + INTEGRITY_LEVEL_UNTRUSTED).
+            patched = patched.replace(
+                "  result = config->SetTokenLevel(us.mInitialTokenLevel, us.mDelayedTokenLevel);\n"
+                "  SANDBOX_ENSURE_SUCCESS(\n"
+                "      result,\n"
+                '      "SetTokenLevel should never fail with these arguments, what happened?");\n',
+                (
+                    "  auto win7DelayedToken = us.mDelayedTokenLevel;\n"
+                    "  if (!mozilla::IsWin8OrLater() &&\n"
+                    "      (win7DelayedToken == sandbox::USER_LOCKDOWN ||\n"
+                    "       win7DelayedToken == sandbox::USER_RESTRICTED ||\n"
+                    "       win7DelayedToken == sandbox::USER_RESTRICTED_NON_ADMIN)) {\n"
+                    "    win7DelayedToken = sandbox::USER_LIMITED;\n"
+                    "  }\n"
+                    "  result = config->SetTokenLevel(us.mInitialTokenLevel, win7DelayedToken);\n"
+                    "  SANDBOX_ENSURE_SUCCESS(\n"
+                    "      result,\n"
+                    '      "SetTokenLevel should never fail with these arguments, what happened?");\n'
+                ),
+                1,
+            )
+            patched = patched.replace(
+                "  if (us.mDelayedIntegrityLevel != sandbox::INTEGRITY_LEVEL_LAST) {\n"
+                "    config->SetDelayedIntegrityLevel(us.mDelayedIntegrityLevel);\n"
+                "  }\n",
+                (
+                    "  if (us.mDelayedIntegrityLevel != sandbox::INTEGRITY_LEVEL_LAST) {\n"
+                    "    auto win7DelayedIL = us.mDelayedIntegrityLevel;\n"
+                    "    if (!mozilla::IsWin8OrLater() &&\n"
+                    "        win7DelayedIL == sandbox::INTEGRITY_LEVEL_UNTRUSTED) {\n"
+                    "      win7DelayedIL = sandbox::INTEGRITY_LEVEL_LOW;\n"
+                    "    }\n"
+                    "    config->SetDelayedIntegrityLevel(win7DelayedIL);\n"
+                    "  }\n"
                 ),
                 1,
             )
@@ -2607,7 +2688,32 @@ def patch_chromium_sandbox_runtime_win7(firefox_dir: Path, dry_run: bool) -> lis
                 ),
                 1,
             )
-            # GMP Win32k lockdown guard (Feodor2 2c10acccb6).
+            # GMP sandbox: cap Win7 token/integrity to USER_LIMITED + LOW, and guard Win32k lockdown.
+            patched = patched.replace(
+                "  // The Widevine CDM on Windows can only load at USER_RESTRICTED\n"
+                "  auto level = (aGMPSandboxKind == Widevine) ? sandbox::USER_RESTRICTED\n"
+                "                                             : sandbox::USER_LOCKDOWN;\n"
+                "  result = config->SetTokenLevel(sandbox::USER_RESTRICTED_SAME_ACCESS, level);\n",
+                (
+                    "  // The Widevine CDM on Windows can only load at USER_RESTRICTED\n"
+                    "  auto level = (aGMPSandboxKind == Widevine) ? sandbox::USER_RESTRICTED\n"
+                    "                                             : sandbox::USER_LOCKDOWN;\n"
+                    "  if (!mozilla::IsWin8OrLater()) {\n"
+                    "    level = sandbox::USER_LIMITED;\n"
+                    "  }\n"
+                    "  result = config->SetTokenLevel(sandbox::USER_RESTRICTED_SAME_ACCESS, level);\n"
+                ),
+                1,
+            )
+            patched = patched.replace(
+                "  config->SetDelayedIntegrityLevel(sandbox::INTEGRITY_LEVEL_UNTRUSTED);\n",
+                (
+                    "  config->SetDelayedIntegrityLevel(\n"
+                    "      mozilla::IsWin8OrLater() ? sandbox::INTEGRITY_LEVEL_UNTRUSTED\n"
+                    "                               : sandbox::INTEGRITY_LEVEL_LOW);\n"
+                ),
+                1,
+            )
             patched = patched.replace(
                 "  if (StaticPrefs::security_sandbox_gmp_win32k_disable() &&\n"
                 "      aGMPSandboxKind != Widevine && aGMPSandboxKind != Clearkey &&\n"
@@ -2814,6 +2920,54 @@ def patch_chromium_sandbox_runtime_win7(firefox_dir: Path, dry_run: bool) -> lis
             if not dry_run:
                 ptw_cc.write_text(patched, encoding="utf-8")
             touched.append(str(ptw_cc.relative_to(firefox_dir)))
+
+    # --- 21m. toolkit/xre/dllservices/mozglue/WindowsStackWalkInitialization.cpp ---
+    # LdrResolveDelayLoadedAPI requires Windows 8+, and CollectStackWalkLocks()
+    # uses CPU Trap Flag single-stepping to probe Win8+ RtlLookupFunctionEntry
+    # SRWLOCKs that do not exist on Windows 7 SP1 (r3dfox commit 6e77dec4ad).
+    wsw_cpp = firefox_dir / "toolkit/xre/dllservices/mozglue/WindowsStackWalkInitialization.cpp"
+    if wsw_cpp.is_file():
+        orig = wsw_cpp.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        if "[Könfox Win7]" not in patched:
+            if '#include "mozilla/WindowsVersion.h"' not in patched:
+                patched = patched.replace(
+                    '#include "mozilla/WindowsProcessMitigations.h"\n',
+                    '#include "mozilla/WindowsProcessMitigations.h"\n'
+                    '#include "mozilla/WindowsVersion.h"\n',
+                    1,
+                )
+            patched = patched.replace(
+                '    if (!stub_LdrResolveDelayLoadedAPI.Set(NtDllIntercept,\n'
+                '                                           "LdrResolveDelayLoadedAPI",\n'
+                '                                           &patched_LdrResolveDelayLoadedAPI)) {\n',
+                (
+                    "    // [Könfox Win7] LdrResolveDelayLoadedAPI was introduced in Windows 8.\n"
+                    "    if (mozilla::IsWin8OrLater() &&\n"
+                    '        !stub_LdrResolveDelayLoadedAPI.Set(NtDllIntercept,\n'
+                    '                                           "LdrResolveDelayLoadedAPI",\n'
+                    '                                           &patched_LdrResolveDelayLoadedAPI)) {\n'
+                ),
+                1,
+            )
+            patched = patched.replace(
+                "MFBT_API\n"
+                "bool CollectStackWalkLocks(Array<void*, 2>& aStackWalkLocks) {\n",
+                (
+                    "MFBT_API\n"
+                    "bool CollectStackWalkLocks(Array<void*, 2>& aStackWalkLocks) {\n"
+                    "  // [Könfox Win7] Single-stepping RtlLookupFunctionEntry for Win8+ SRWLOCKs\n"
+                    "  // is unsupported on Windows 7 SP1.\n"
+                    "  if (!mozilla::IsWin8OrLater()) {\n"
+                    "    return false;\n"
+                    "  }\n"
+                ),
+                1,
+            )
+        if patched != orig:
+            if not dry_run:
+                wsw_cpp.write_text(patched, encoding="utf-8")
+            touched.append(str(wsw_cpp.relative_to(firefox_dir)))
 
     return touched
 
@@ -3981,9 +4135,10 @@ def patch_ipc_and_networking_win7(firefox_dir: Path, dry_run: bool) -> list[str]
       - ipc/mscom/ProcessRuntime.cpp: guard WinBuiltinAnyPackageSid and
         TokenAppContainerSid behind IsWin8OrLater() so ProcessRuntime::
         InitializeSecurity() succeeds on Windows 7 SP1.
-      - ipc/glue/SharedMemoryPlatform_windows.cpp: give freezable shared memory
-        mappings a random name on < Win8.1 because Windows 7 ignores
-        SECURITY_ATTRIBUTES on unnamed file mappings.
+      - ipc/glue/SharedMemoryPlatform_windows.cpp: intentionally left UNMODIFIED
+        (upstream lpName = nullptr, matching r3dfox win-153). Assigning a name
+        to an empty-DACL file mapping causes ERROR_ACCESS_DENIED on Win7 SP1 in
+        both Platform::Freeze() and sandboxed content processes!
       - netwerk/socket/neqo_glue/src/lib.rs: disable pmtud_iface_mtu on Windows
         to avoid unsupported Win7 interface MTU queries in HTTP/3 QUIC.
     """
@@ -4026,73 +4181,9 @@ def patch_ipc_and_networking_win7(firefox_dir: Path, dry_run: bool) -> list[str]
                 pr_cpp.write_text(patched, encoding="utf-8")
             touched.append(str(pr_cpp.relative_to(firefox_dir)))
 
-    # 25b. ipc/glue/SharedMemoryPlatform_windows.cpp
-    shm_cpp = firefox_dir / "ipc/glue/SharedMemoryPlatform_windows.cpp"
-    if shm_cpp.is_file():
-        orig = shm_cpp.read_text(encoding="utf-8", errors="replace")
-        patched = orig
-        if "[Könfox Win7]" not in patched:
-            if '#include "mozilla/WindowsVersion.h"' not in patched:
-                patched = patched.replace(
-                    '#include "nsDebug.h"',
-                    (
-                        '#include "nsDebug.h"\n'
-                        "#include <cwchar>\n"
-                        "#include <iterator>\n"
-                        '#include "mozilla/RandomNum.h"\n'
-                        '#include "mozilla/WindowsVersion.h"'
-                    ),
-                    1,
-                )
-            old_dacl = "  ACL dacl;\n\n  if (aFreezable) {"
-            new_dacl = (
-                "  ACL dacl;\n"
-                "  wchar_t name[80] = {};\n\n"
-                "  if (aFreezable) {"
-            )
-            old_sd = (
-                "        NS_WARN_IF(!::SetSecurityDescriptorDacl(&sd, TRUE, &dacl, FALSE))) {\n"
-                "      return Nothing();\n"
-                "    }\n"
-                "  }\n\n"
-                "  auto handle = MozCreateFileMappingW(psa, PAGE_READWRITE, 0,\n"
-                "                                      static_cast<DWORD>(aSize), nullptr);"
-            )
-            new_sd = (
-                "        NS_WARN_IF(!::SetSecurityDescriptorDacl(&sd, TRUE, &dacl, FALSE))) {\n"
-                "      return Nothing();\n"
-                "    }\n\n"
-                "    // [Könfox Win7] Windows 7 ignores SECURITY_ATTRIBUTES on unnamed\n"
-                "    // file mappings; assign a random name on < Windows 8.1.\n"
-                "    if (!mozilla::IsWin8Point1OrLater()) {\n"
-                "      mozilla::Maybe<uint64_t> r0 = mozilla::RandomUint64();\n"
-                "      mozilla::Maybe<uint64_t> r1 = mozilla::RandomUint64();\n"
-                "      mozilla::Maybe<uint64_t> r2 = mozilla::RandomUint64();\n"
-                "      mozilla::Maybe<uint64_t> r3 = mozilla::RandomUint64();\n"
-                "      if (NS_WARN_IF(r0.isNothing() || r1.isNothing() ||\n"
-                "                     r2.isNothing() || r3.isNothing())) {\n"
-                "        return Nothing();\n"
-                "      }\n"
-                "      swprintf_s(name, std::size(name),\n"
-                '                 L"MozSharedMem_%016llx%016llx%016llx%016llx",\n'
-                "                 static_cast<unsigned long long>(*r0),\n"
-                "                 static_cast<unsigned long long>(*r1),\n"
-                "                 static_cast<unsigned long long>(*r2),\n"
-                "                 static_cast<unsigned long long>(*r3));\n"
-                "    }\n"
-                "  }\n\n"
-                "  auto handle = MozCreateFileMappingW(\n"
-                "      psa, PAGE_READWRITE, 0, static_cast<DWORD>(aSize),\n"
-                "      name[0] ? name : nullptr);"
-            )
-            if old_dacl in patched and old_sd in patched:
-                patched = patched.replace(old_dacl, new_dacl, 1).replace(
-                    old_sd, new_sd, 1
-                )
-        if patched != orig:
-            if not dry_run:
-                shm_cpp.write_text(patched, encoding="utf-8")
-            touched.append(str(shm_cpp.relative_to(firefox_dir)))
+    # (25b removed: ipc/glue/SharedMemoryPlatform_windows.cpp MUST remain
+    # unnamed (lpName = nullptr) on Windows 7 SP1 — naming an empty-DACL
+    # mapping causes ERROR_ACCESS_DENIED in Freeze() and sandboxed children.)
 
     # 25c. netwerk/socket/neqo_glue/src/lib.rs
     neqo_rs = firefox_dir / "netwerk/socket/neqo_glue/src/lib.rs"
@@ -4899,6 +4990,19 @@ def patch_konfox_profile_launcher_and_telemetry(firefox_dir: Path, dry_run: bool
             ),
         ],
         marker="[Könfox] Telemetry/Glean disabled:",
+    )
+
+    _patch_file(
+        "toolkit/library/rust/gkrust-features.mozbuild",
+        [
+            (
+                'if not CONFIG["MOZILLA_OFFICIAL"]:\n'
+                '    gkrust_features += ["glean_disable_upload"]\n',
+                '# [Könfox] Always compile Glean with upload disabled.\n'
+                'gkrust_features += ["glean_disable_upload"]\n',
+            ),
+        ],
+        marker="[Könfox] Always compile Glean with upload disabled.",
     )
 
     return touched

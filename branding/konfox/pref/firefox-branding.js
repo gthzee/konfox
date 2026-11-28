@@ -15,12 +15,12 @@ pref("app.update.auto", false);
 pref("app.update.silent", false);
 pref("app.update.interval", 86400);
 pref("app.update.promptWaitTime", 43200);
-pref("app.update.url.manual", "https://github.com/konfox-browser/konfox/releases");
-pref("app.update.url.details", "https://github.com/konfox-browser/konfox/releases");
+pref("app.update.url.manual", "https://github.com/gthzee/konfox/releases");
+pref("app.update.url.details", "https://github.com/gthzee/konfox/releases");
 
-pref("app.releaseNotesURL", "https://github.com/konfox-browser/konfox/releases");
-pref("app.releaseNotesURL.aboutDialog", "https://github.com/konfox-browser/konfox/releases");
-pref("app.releaseNotesURL.prompt", "https://github.com/konfox-browser/konfox/releases");
+pref("app.releaseNotesURL", "https://github.com/gthzee/konfox/releases");
+pref("app.releaseNotesURL.aboutDialog", "https://github.com/gthzee/konfox/releases");
+pref("app.releaseNotesURL.prompt", "https://github.com/gthzee/konfox/releases");
 
 pref("app.update.checkInstallTime.days", 30);
 pref("app.update.badgeWaitTime", 0);
@@ -28,9 +28,11 @@ pref("app.update.badgeWaitTime", 0);
 // Keep Nightly developer ergonomics.
 pref("devtools.selfxss.count", 5);
 
-// Windows 7 SP1 networking reliability: disable Nightly-only experimental
-// WinRegistry/WinINet proxy change watcher (OFF in Firefox Release/ESR).
+// Windows 7 SP1 networking reliability:
+// - disable Nightly-only experimental WinRegistry/WinINet proxy change watcher
+// - disable HTTP/3 (QUIC/UDP) so Win7 uses fast, reliable HTTP/2 & HTTP/1.1 TCP
 pref("network.proxy.detect_system_proxy_changes", false);
+pref("network.http.http3.enable", false);
 
 // ---------------------------------------------------------------------------
 // Könfox: Completely disable all AI / ML / GenAI features and "AI Controls" UI

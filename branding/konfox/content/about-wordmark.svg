@@ -1,8 +1,11 @@
+<!-- This Source Code Form is subject to the terms of the Mozilla Public
+   - License, v. 2.0. If a copy of the MPL was not distributed with this
+   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 280 48" width="280" height="48">
   <style>
     :root { color-scheme: light dark; }
     .word { font-family: "Segoe UI", system-ui, -apple-system, sans-serif; font-weight: 700; font-size: 28px; fill: light-dark(#0f172a, #f8fafc); }
-    .tag  { font-family: "Segoe UI", system-ui, -apple-system, sans-serif; font-weight: 600; font-size: 15px; fill: light-dark(#4f46e5, #818cf8); letter-spacing: 0.08em; }
+    .tag  { font-family: "Segoe UI", system-ui, -apple-system, sans-serif; font-weight: 600; font-size: 15px; fill: light-dark(#dc2626, #f87171); letter-spacing: 0.08em; }
   </style>
   <text x="4" y="34" class="word">Könfox</text>
   <text x="116" y="34" class="tag">NIGHTLY</text>

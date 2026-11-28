@@ -926,7 +926,7 @@ class KonfoxToolchainTests(unittest.TestCase):
                 p.write_text(content, encoding="utf-8")
 
             self.assertEqual(len(apply_win7_patches.patch_chromium_sandbox_runtime_win7(ff, False)), 2)
-            self.assertEqual(len(apply_win7_patches.patch_ipc_and_networking_win7(ff, False)), 3)
+            self.assertEqual(len(apply_win7_patches.patch_ipc_and_networking_win7(ff, False)), 2)
             self.assertEqual(len(apply_win7_patches.patch_win7_titlebar_icons(ff, False)), 1)
             self.assertEqual(len(apply_win7_patches.patch_remove_ai_features(ff, False)), 6)
 
@@ -934,7 +934,7 @@ class KonfoxToolchainTests(unittest.TestCase):
             self.assertIn("WIN10_20H1", (ff / "security/sandbox/chromium/sandbox/win/src/process_mitigations.cc").read_text(encoding="utf-8"))
             self.assertIn("ERROR_INVALID_PARAMETER", (ff / "security/sandbox/chromium/sandbox/win/src/startup_information_helper.cc").read_text(encoding="utf-8"))
             self.assertIn("appContainersSupported", (ff / "ipc/mscom/ProcessRuntime.cpp").read_text(encoding="utf-8"))
-            self.assertIn("MozSharedMem_", (ff / "ipc/glue/SharedMemoryPlatform_windows.cpp").read_text(encoding="utf-8"))
+            self.assertNotIn("MozSharedMem_", (ff / "ipc/glue/SharedMemoryPlatform_windows.cpp").read_text(encoding="utf-8"))
             self.assertIn('target_os = "windows"', (ff / "netwerk/socket/neqo_glue/src/lib.rs").read_text(encoding="utf-8"))
 
             bcss = (ff / "browser/themes/windows/browser.css").read_text(encoding="utf-8")
@@ -1351,6 +1351,10 @@ class KonfoxToolchainTests(unittest.TestCase):
                     "  return NS_OK;\n"
                     "}\n"
                 ),
+                "toolkit/library/rust/gkrust-features.mozbuild": (
+                    'if not CONFIG["MOZILLA_OFFICIAL"]:\n'
+                    '    gkrust_features += ["glean_disable_upload"]\n'
+                ),
             }
             for rel, content in files.items():
                 p = ff / rel
@@ -1358,7 +1362,7 @@ class KonfoxToolchainTests(unittest.TestCase):
                 p.write_text(content, encoding="utf-8")
 
             touched = apply_win7_patches.patch_konfox_profile_launcher_and_telemetry(ff, False)
-            self.assertEqual(len(touched), 7)
+            self.assertEqual(len(touched), 8)
 
             self.assertIn("if (!mozilla::IsWin8OrLater())", (ff / "browser/app/winlauncher/LauncherProcessWin.cpp").read_text(encoding="utf-8"))
             bm = (ff / "browser/moz.configure").read_text(encoding="utf-8")
@@ -1374,6 +1378,9 @@ class KonfoxToolchainTests(unittest.TestCase):
             fog = (ff / "toolkit/components/glean/xpcom/FOG.cpp").read_text(encoding="utf-8")
             self.assertIn("sKonfoxFogSkipped = true;", fog)
             self.assertIn("if (sKonfoxFogSkipped)", fog)
+            gkr = (ff / "toolkit/library/rust/gkrust-features.mozbuild").read_text(encoding="utf-8")
+            self.assertNotIn('if not CONFIG["MOZILLA_OFFICIAL"]:', gkr)
+            self.assertIn('gkrust_features += ["glean_disable_upload"]', gkr)
 
             # Check mozconfigs and branding prefs
             root = Path(__file__).resolve().parent.parent
@@ -1385,6 +1392,7 @@ class KonfoxToolchainTests(unittest.TestCase):
 
             bjs = (root / "branding/konfox/pref/firefox-branding.js").read_text(encoding="utf-8")
             for key in (
+                'pref("network.http.http3.enable", false);',
                 'pref("browser.launcherProcess.enabled", false);',
                 'pref("datareporting.policy.dataSubmissionEnabled", false);',
                 'pref("datareporting.healthreport.uploadEnabled", false);',
@@ -1396,6 +1404,226 @@ class KonfoxToolchainTests(unittest.TestCase):
 
             # Pass 2: 100% idempotent
             self.assertEqual(apply_win7_patches.patch_konfox_profile_launcher_and_telemetry(ff, False), [])
+
+    def test_run16_win7_tab_crash_and_network_fixes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ff = Path(tmp) / "firefox"
+            files = {
+                "security/sandbox/win/src/sandboxbroker/sandboxBroker.cpp": (
+                    "#ifdef MOZ_THUNDERBIRD\n"
+                    "  // In Thunderbird, mInitDllBlocklistOOP is null, so InitDllBlocklistOOP would\n"
+                    "  // hit MOZ_RELEASE_ASSERT.\n"
+                    "  constexpr bool isThunderbird = true;\n"
+                    "#else\n"
+                    "  constexpr bool isThunderbird = false;\n"
+                    "#endif\n\n"
+                    "  if (!isThunderbird &&\n"
+                    "      XRE_GetChildProcBinPathType(aProcessType) == BinPathType::Self) {\n"
+                    "    // oop\n"
+                    "  } else {\n"
+                    "    // Load the child executable as a datafile so that we can examine its\n"
+                    "    // headers without doing a full load with dependencies and such.\n"
+                    "  }\n"
+                    "bool BuildUtilitySandbox(sandbox::TargetConfig* config, const UtilitySandboxProps& us) {\n"
+                    "  result = config->SetTokenLevel(us.mInitialTokenLevel, us.mDelayedTokenLevel);\n"
+                    "  SANDBOX_ENSURE_SUCCESS(\n"
+                    "      result,\n"
+                    '      "SetTokenLevel should never fail with these arguments, what happened?");\n'
+                    "  if (us.mDelayedIntegrityLevel != sandbox::INTEGRITY_LEVEL_LAST) {\n"
+                    "    config->SetDelayedIntegrityLevel(us.mDelayedIntegrityLevel);\n"
+                    "  }\n"
+                    "  // Add the policy for the client side of the crash server pipe.\n"
+                    "  result = config->AllowFileAccess(sandbox::FileSemantics::kAllowAny,\n"
+                    '                                   L"\\\\??\\\\pipe\\\\gecko-crash-server-pipe.*");\n'
+                    "  return true;\n"
+                    "}\n"
+                    "bool SandboxBroker::SetSecurityLevelForGMPlugin(GMPSandboxKind aGMPSandboxKind) {\n"
+                    "  // The Widevine CDM on Windows can only load at USER_RESTRICTED\n"
+                    "  auto level = (aGMPSandboxKind == Widevine) ? sandbox::USER_RESTRICTED\n"
+                    "                                             : sandbox::USER_LOCKDOWN;\n"
+                    "  result = config->SetTokenLevel(sandbox::USER_RESTRICTED_SAME_ACCESS, level);\n"
+                    "  config->SetDelayedIntegrityLevel(sandbox::INTEGRITY_LEVEL_UNTRUSTED);\n"
+                    "  // Add the policy for the client side of the crash server pipe.\n"
+                    "  result = config->AllowFileAccess(sandbox::FileSemantics::kAllowAny,\n"
+                    '                                   L"\\\\??\\\\pipe\\\\gecko-crash-server-pipe.*");\n'
+                    "  return true;\n"
+                    "}\n"
+                ),
+                "toolkit/xre/dllservices/mozglue/WindowsStackWalkInitialization.cpp": (
+                    '#include "mozilla/WindowsProcessMitigations.h"\n'
+                    '    if (!stub_LdrResolveDelayLoadedAPI.Set(NtDllIntercept,\n'
+                    '                                           "LdrResolveDelayLoadedAPI",\n'
+                    '                                           &patched_LdrResolveDelayLoadedAPI)) {\n'
+                    "      installedAll = false;\n"
+                    "    }\n"
+                    "MFBT_API\n"
+                    "bool CollectStackWalkLocks(Array<void*, 2>& aStackWalkLocks) {\n"
+                    "  return true;\n"
+                    "}\n"
+                ),
+            }
+            for rel, content in files.items():
+                p = ff / rel
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(content, encoding="utf-8")
+
+            touched = apply_win7_patches.patch_chromium_sandbox_runtime_win7(ff, False)
+            self.assertEqual(len(touched), 2)
+
+            sb = (ff / "security/sandbox/win/src/sandboxbroker/sandboxBroker.cpp").read_text(encoding="utf-8")
+            self.assertIn("#if defined(MOZ_THUNDERBIRD) || !defined(MOZ_LAUNCHER_PROCESS)", sb)
+            self.assertIn("if (mozilla::IsWin8OrLater() && !isThunderbird &&", sb)
+            self.assertIn("} else if (mozilla::IsWin8OrLater() && !isThunderbird) {", sb)
+            self.assertIn("win7DelayedToken = sandbox::USER_LIMITED;", sb)
+            self.assertIn("win7DelayedIL = sandbox::INTEGRITY_LEVEL_LOW;", sb)
+            self.assertIn("mozilla::IsWin8OrLater() ? sandbox::INTEGRITY_LEVEL_UNTRUSTED", sb)
+            self.assertEqual(sb.count(r'LR"(\Device\KsecDD)"'), 2)
+
+            wsw = (ff / "toolkit/xre/dllservices/mozglue/WindowsStackWalkInitialization.cpp").read_text(encoding="utf-8")
+            self.assertIn('#include "mozilla/WindowsVersion.h"', wsw)
+            self.assertIn("if (mozilla::IsWin8OrLater() &&", wsw)
+            self.assertIn("if (!mozilla::IsWin8OrLater()) {\n    return false;\n  }", wsw)
+
+            # Pass 2: 100% idempotent
+            self.assertEqual(apply_win7_patches.patch_chromium_sandbox_runtime_win7(ff, False), [])
+
+    def test_run17_branding_urls_icons_and_sfx_patching(self) -> None:
+        brand_dir = ROOT / "branding" / "konfox"
+
+        # 1. Verify all website / release URLs point to github.com/gthzee/konfox/releases
+        #    and no fake konfox-browser URLs remain anywhere in branding/konfox/
+        for p in brand_dir.rglob("*"):
+            if p.is_file() and p.suffix in (".nsi", ".js", ".ftl", ".properties", ".sh", ".svg", ".css"):
+                txt = p.read_text(encoding="utf-8")
+                self.assertNotIn("konfox-browser", txt, f"Stale fake URL in {p}")
+
+        nsi = (brand_dir / "branding.nsi").read_text(encoding="utf-8")
+        self.assertIn('!define URLInfoAbout          "https://github.com/gthzee/konfox/releases"', nsi)
+        self.assertIn('!define HelpLink              "https://github.com/gthzee/konfox/releases"', nsi)
+        self.assertIn('!define URLManualDownload "https://github.com/gthzee/konfox/releases"', nsi)
+
+        bjs = (brand_dir / "pref" / "firefox-branding.js").read_text(encoding="utf-8")
+        self.assertIn('pref("app.update.url.manual", "https://github.com/gthzee/konfox/releases");', bjs)
+        self.assertIn('pref("app.releaseNotesURL.aboutDialog", "https://github.com/gthzee/konfox/releases");', bjs)
+        self.assertIn('pref("network.http.http3.enable", false);', bjs)
+
+        # 2. Verify NSIS BMP headers (24-bit uncompressed RGB) & exact pixel dimensions
+        for fname, exp_w, exp_h in (
+            ("wizWatermark.bmp", 164, 314),
+            ("wizHeader.bmp", 150, 57),
+            ("wizHeaderRTL.bmp", 150, 57),
+        ):
+            raw = (brand_dir / fname).read_bytes()
+            self.assertEqual(raw[:2], b"BM", f"{fname} must be BMP")
+            w, h, _planes, bpp, comp = struct.unpack_from("<iiHHI", raw, 18)
+            self.assertEqual((w, abs(h), bpp, comp), (exp_w, exp_h, 24, 0), f"Bad BMP header in {fname}")
+
+        # 3. Verify all Windows .ico files parse cleanly and have required resolutions
+        for fname, exp_sizes in (
+            ("firefox.ico", {(16, 16), (32, 32), (48, 48), (256, 256)}),
+            ("pbmode.ico", {(16, 16), (32, 32), (48, 48), (256, 256)}),
+            ("setup.ico", {(16, 16), (32, 32), (48, 48), (256, 256)}),
+            ("document.ico", {(16, 16), (32, 32), (48, 48), (256, 256)}),
+            ("document_pdf.ico", {(16, 16), (32, 32), (48, 48), (256, 256)}),
+            ("firefox64.ico", {(16, 16), (32, 32), (48, 48), (64, 64)}),
+        ):
+            entries = apply_branding._parse_ico((brand_dir / fname).read_bytes())
+            self.assertEqual(set(entries.keys()), exp_sizes, f"Unexpected sizes in {fname}")
+        # setup.ico 256px PNG must fit inside upstream 7zSD.Win32.sfx RT_ICON #4 slot (43,467 bytes)
+        setup_entries = apply_branding._parse_ico((brand_dir / "setup.ico").read_bytes())
+        self.assertLessEqual(len(setup_entries[(256, 256)][2]), 43467)
+
+        # 4. Build a minimal synthetic PE with .rsrc RT_ICON #1..4 & RT_GROUP_ICON #1
+        #    and verify apply_branding() installs setup.ico and patches 7zSD.Win32.sfx cleanly
+        def build_synthetic_sfx_pe() -> bytes:
+            rsrc_rva = 0x2000
+            rsrc_off = 0x400
+            # Build 3-level .rsrc: Root(2 types: 3, 14) -> Name dirs -> Lang dirs -> Data entries
+            # Lay out slots big enough to hold 16/32/48/256 icons
+            slot_caps = [1320, 5160, 11560, 43467]
+            rsrc = bytearray(0x10000)
+
+            def write_dir(off: int, entries: list[tuple[int, int]]) -> None:
+                struct.pack_into("<IIHHHH", rsrc, off, 0, 0, 0, 0, 0, len(entries))
+                for idx, (k, v) in enumerate(entries):
+                    struct.pack_into("<II", rsrc, off + 16 + idx * 8, k, v)
+
+            # Root at 0x000: RT_ICON(3) -> dir 0x040, RT_GROUP_ICON(14) -> dir 0x0A0
+            write_dir(0x000, [(3, 0x80000040), (14, 0x800000A0)])
+            # RT_ICON IDs 1..4 -> lang dirs at 0x100, 0x120, 0x140, 0x160
+            write_dir(0x040, [(i + 1, 0x80000000 | (0x100 + i * 0x20)) for i in range(4)])
+            # RT_GROUP_ICON ID 1 -> lang dir at 0x180
+            write_dir(0x0A0, [(1, 0x80000180)])
+            # Lang dirs -> data entries at 0x200 + i*0x10, group at 0x240
+            for i in range(4):
+                write_dir(0x100 + i * 0x20, [(1033, 0x200 + i * 0x10)])
+            write_dir(0x180, [(1033, 0x240)])
+
+            # Place icon slots starting at 0x400 inside .rsrc
+            cur = 0x400
+            dims = [16, 32, 48, 256]
+            grp_blob = bytearray(struct.pack("<HHH", 0, 1, 4))
+            for i, (dim, cap) in enumerate(zip(dims, slot_caps)):
+                struct.pack_into("<IIII", rsrc, 0x200 + i * 0x10, rsrc_rva + cur, cap, 0, 0)
+                rsrc[cur : cur + cap] = b"\xAA" * cap
+                wb = 0 if dim == 256 else dim
+                grp_blob.extend(struct.pack("<BBBBHHIH", wb, wb, 0, 0, 1, 32, cap, i + 1))
+                cur += cap
+            grp_off_in_rsrc = cur
+            struct.pack_into("<IIII", rsrc, 0x240, rsrc_rva + grp_off_in_rsrc, len(grp_blob), 0, 0)
+            rsrc[grp_off_in_rsrc : grp_off_in_rsrc + len(grp_blob)] = grp_blob
+
+            # Construct minimal PE32 header with 1 section (.rsrc)
+            hdr = bytearray(rsrc_off)
+            hdr[:2] = b"MZ"
+            pe_off = 0x80
+            struct.pack_into("<I", hdr, 0x3C, pe_off)
+            hdr[pe_off : pe_off + 4] = b"PE\x00\x00"
+            struct.pack_into("<HHIIIHH", hdr, pe_off + 4, 0x014C, 1, 0, 0, 0, 0xE0, 0x0102)
+            opt_off = pe_off + 24
+            struct.pack_into("<H", hdr, opt_off, 0x010B)  # PE32 magic
+            sec_off = opt_off + 0xE0
+            hdr[sec_off : sec_off + 5] = b".rsrc"
+            struct.pack_into("<IIII", hdr, sec_off + 8, len(rsrc), rsrc_rva, len(rsrc), rsrc_off)
+            raw_pe = bytearray(hdr + rsrc)
+            cs = apply_branding._compute_pe_checksum(raw_pe, opt_off + 64)
+            struct.pack_into("<I", raw_pe, opt_off + 64, cs)
+            return bytes(raw_pe)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ff = Path(tmp) / "firefox"
+            (ff / "browser/branding/nightly/content").mkdir(parents=True)
+            (ff / "browser/branding/nightly/firefox.ico").write_bytes(b"OLD_NIGHTLY_ICO")
+            (ff / "toolkit/mozapps/installer/windows/nsis").mkdir(parents=True)
+            (ff / "toolkit/mozapps/installer/windows/nsis/setup.ico").write_bytes(b"OLD_SETUP_ICO")
+            sfx = ff / "other-licenses/7zstub/firefox/7zSD.Win32.sfx"
+            sfx.parent.mkdir(parents=True)
+            sfx.write_bytes(build_synthetic_sfx_pe())
+
+            out = apply_branding.apply_branding(ff, brand_dir, rasterize=True)
+            # Branding icons copied intact and NOT clobbered
+            self.assertEqual((out / "firefox.ico").read_bytes(), (brand_dir / "firefox.ico").read_bytes())
+            self.assertEqual((out / "pbmode.ico").read_bytes(), (brand_dir / "pbmode.ico").read_bytes())
+            self.assertEqual((out / "wizWatermark.bmp").read_bytes(), (brand_dir / "wizWatermark.bmp").read_bytes())
+            self.assertEqual((out / "wizHeader.bmp").read_bytes(), (brand_dir / "wizHeader.bmp").read_bytes())
+            self.assertEqual((out / "wizHeaderRTL.bmp").read_bytes(), (brand_dir / "wizHeaderRTL.bmp").read_bytes())
+            self.assertFalse((out / "setup.ico").exists())
+
+            # NSIS setup.ico replaced
+            self.assertEqual(
+                (ff / "toolkit/mozapps/installer/windows/nsis/setup.ico").read_bytes(),
+                (brand_dir / "setup.ico").read_bytes(),
+            )
+
+            # 7zSD.Win32.sfx patched with valid PE checksum and PNG 256px payload
+            patched_pe = sfx.read_bytes()
+            cs_off = 0x80 + 24 + 64
+            stored_cs = struct.unpack_from("<I", patched_pe, cs_off)[0]
+            self.assertEqual(stored_cs, apply_branding._compute_pe_checksum(patched_pe, cs_off))
+            self.assertIn(setup_entries[(256, 256)][2], patched_pe)
+
+            # Re-running apply_branding() is idempotent on already-patched SFX
+            apply_branding.apply_branding(ff, brand_dir, rasterize=True)
 
 
 if __name__ == "__main__":
