@@ -4705,6 +4705,205 @@ def patch_remove_ai_features(firefox_dir: Path, dry_run: bool) -> list[str]:
     return touched
 
 
+def patch_konfox_profile_launcher_and_telemetry(firefox_dir: Path, dry_run: bool) -> list[str]:
+    """
+    Step 28 — Könfox profile directory, Win7 launcher guard, and complete telemetry removal:
+      28a. browser/app/winlauncher/LauncherProcessWin.cpp:
+           Skip the Windows 10+ out-of-process launcher on < Win8 (Windows 7 SP1)
+           so DllBlocklistInit.cpp:58 never fails with INTERCEPTOR_MOD_INACCESSIBLE (EventID 2)
+           or logs Windows Event Viewer errors even if invoked with -launcher / env var.
+      28b. browser/moz.configure, mozglue/misc/PreXULSkeletonUI.cpp,
+           toolkit/crashreporter/crash_helper_server/src/logging/env.rs:
+           Place Könfox user data directly under %APPDATA%\\Konfox\\ and
+           %LOCALAPPDATA%\\Konfox\\ (not nested under Mozilla\\) via
+           MOZ_APP_PROFILE="Konfox" and MOZ_APP_VENDOR="Konfox".
+      28c. xpcom/build/LateWriteChecks.cpp,
+           toolkit/components/telemetry/core/Telemetry.cpp,
+           toolkit/components/glean/xpcom/FOG.cpp:
+           Completely disable on-disk and in-memory telemetry recording:
+             - Never create Telemetry.LateWriteFinal-* files in the profile dir
+             - Never record legacy Telemetry histograms/scalars/events or Telemetry.ShutdownTime.txt
+             - Skip Glean/FOG initialization & datareporting/glean dir creation when upload is off
+    """
+    touched: list[str] = []
+
+    def _patch_file(rel: str, replacements: list[tuple[str, str]], marker: str = "[Könfox]") -> None:
+        p = firefox_dir / rel
+        if not p.is_file():
+            return
+        orig = p.read_text(encoding="utf-8", errors="replace")
+        patched = orig
+        if marker not in patched:
+            for old, new in replacements:
+                if old in patched:
+                    patched = patched.replace(old, new, 1)
+        if patched != orig:
+            if not dry_run:
+                p.write_text(patched, encoding="utf-8")
+            touched.append(rel)
+
+    # --- 28a. browser/app/winlauncher/LauncherProcessWin.cpp ---
+    _patch_file(
+        "browser/app/winlauncher/LauncherProcessWin.cpp",
+        [
+            (
+                "  // Called from the launcher process *and* the browser process.\n"
+                "  EnablePreferLoadFromSystem32IfCompatible();\n",
+                "  // Called from the launcher process *and* the browser process.\n"
+                "  EnablePreferLoadFromSystem32IfCompatible();\n"
+                "\n"
+                "  // [Könfox] Skip Win10+ out-of-process launcher on Windows 7 SP1 so\n"
+                "  // DllBlocklistInit.cpp:58 never fails with INTERCEPTOR_MOD_INACCESSIBLE\n"
+                "  // (EventID 2) or spawns/terminates a suspended child process.\n"
+                "  if (!mozilla::IsWin8OrLater()) {\n"
+                "    return Nothing();\n"
+                "  }\n",
+            ),
+        ],
+        marker="[Könfox] Skip Win10+ out-of-process launcher",
+    )
+
+    # --- 28b. Own AppData\Roaming\Konfox & AppData\Local\Konfox (not under Mozilla\) ---
+    _patch_file(
+        "browser/moz.configure",
+        [
+            (
+                'imply_option("MOZ_APP_VENDOR", "Mozilla")',
+                '# [Könfox] Own top-level %APPDATA%\\Konfox and %LOCALAPPDATA%\\Konfox profile folder.\n'
+                'imply_option("MOZ_APP_VENDOR", "Konfox")\n'
+                'imply_option("MOZ_APP_PROFILE", "Konfox")',
+            ),
+        ],
+        marker='imply_option("MOZ_APP_PROFILE", "Konfox")',
+    )
+
+    _patch_file(
+        "mozglue/misc/PreXULSkeletonUI.cpp",
+        [
+            (
+                '  profileDbPath.append(\n'
+                '      L"\\\\" MOZ_APP_VENDOR L"\\\\" MOZ_APP_BASENAME L"\\\\profiles.ini");',
+                '  // [Könfox] Match MOZ_APP_PROFILE="Konfox" (%APPDATA%\\Konfox\\profiles.ini).\n'
+                '  profileDbPath.append(L"\\\\" MOZ_APP_BASENAME L"\\\\profiles.ini");',
+            ),
+        ],
+        marker='[Könfox] Match MOZ_APP_PROFILE="Konfox"',
+    )
+
+    _patch_file(
+        "toolkit/crashreporter/crash_helper_server/src/logging/env.rs",
+        [
+            (
+                'Some(home_dir.join("AppData").join("Roaming").join(config::MOZ_APP_VENDOR).join(config::MOZ_APP_BASENAME))',
+                '/* [Könfox] Own top-level AppData\\Roaming\\Konfox folder */ '
+                'Some(home_dir.join("AppData").join("Roaming").join(config::MOZ_APP_BASENAME))',
+            ),
+        ],
+        marker="[Könfox] Own top-level AppData\\Roaming\\Konfox",
+    )
+
+    # --- 28c. Complete telemetry & LateWriteChecks removal ---
+    _patch_file(
+        "xpcom/build/LateWriteChecks.cpp",
+        [
+            (
+                "void InitLateWriteChecks() {\n",
+                "void InitLateWriteChecks() {\n"
+                "  // [Könfox] Telemetry disabled: never write Telemetry.LateWriteFinal-* files.\n"
+                "  return;\n",
+            ),
+            (
+                "void BeginLateWriteChecks() {\n",
+                "void BeginLateWriteChecks() {\n"
+                "  // [Könfox] Telemetry disabled: never register late-write IO interposer.\n"
+                "  return;\n",
+            ),
+        ],
+        marker="[Könfox] Telemetry disabled: never write Telemetry.LateWriteFinal",
+    )
+
+    _patch_file(
+        "toolkit/components/telemetry/core/Telemetry.cpp",
+        [
+            (
+                "NS_IMETHODIMP\n"
+                "TelemetryImpl::SetCanRecordBase(bool canRecord) {\n",
+                "NS_IMETHODIMP\n"
+                "TelemetryImpl::SetCanRecordBase(bool canRecord) {\n"
+                "  // [Könfox] Telemetry completely disabled.\n"
+                "  (void)canRecord;\n"
+                "  return NS_OK;\n",
+            ),
+            (
+                "NS_IMETHODIMP\n"
+                "TelemetryImpl::SetCanRecordExtended(bool canRecord) {\n",
+                "NS_IMETHODIMP\n"
+                "TelemetryImpl::SetCanRecordExtended(bool canRecord) {\n"
+                "  // [Könfox] Telemetry completely disabled.\n"
+                "  (void)canRecord;\n"
+                "  return NS_OK;\n",
+            ),
+        ],
+        marker="[Könfox] Telemetry completely disabled.",
+    )
+
+    _patch_file(
+        "toolkit/components/glean/xpcom/FOG.cpp",
+        [
+            (
+                "void FOG::Shutdown() {\n"
+                "  MOZ_ASSERT(XRE_IsParentProcess());\n"
+                "\n"
+                "  if (mIsShutdown) {\n"
+                "    return;\n"
+                "  }\n"
+                "\n"
+                "  UnregisterWeakMemoryReporter(this);\n"
+                "  glean::impl::fog_shutdown();\n"
+                "}",
+                "static bool sKonfoxFogSkipped = false;\n"
+                "\n"
+                "void FOG::Shutdown() {\n"
+                "  MOZ_ASSERT(XRE_IsParentProcess());\n"
+                "\n"
+                "  if (mIsShutdown) {\n"
+                "    return;\n"
+                "  }\n"
+                "  mIsShutdown = true;\n"
+                "  UnregisterWeakMemoryReporter(this);\n"
+                "  if (sKonfoxFogSkipped) {\n"
+                "    // [Könfox] Telemetry/Glean disabled: FOG was never initialized.\n"
+                "    return;\n"
+                "  }\n"
+                "  glean::impl::fog_shutdown();\n"
+                "}",
+            ),
+            (
+                "NS_IMETHODIMP\n"
+                "FOG::InitializeFOG(const nsACString& aDataPathOverride,\n"
+                "                   const nsACString& aAppIdOverride,\n"
+                "                   const bool aDisableInternalPings) {\n"
+                "  MOZ_ASSERT(XRE_IsParentProcess());\n"
+                "  gInitializeCalled = true;\n",
+                "NS_IMETHODIMP\n"
+                "FOG::InitializeFOG(const nsACString& aDataPathOverride,\n"
+                "                   const nsACString& aAppIdOverride,\n"
+                "                   const bool aDisableInternalPings) {\n"
+                "  MOZ_ASSERT(XRE_IsParentProcess());\n"
+                "  gInitializeCalled = true;\n"
+                "  if (!Preferences::GetBool(\"datareporting.healthreport.uploadEnabled\", false)) {\n"
+                "    // [Könfox] Telemetry/Glean disabled: skip fog_init & datareporting/glean dir.\n"
+                "    sKonfoxFogSkipped = true;\n"
+                "    return NS_OK;\n"
+                "  }\n",
+            ),
+        ],
+        marker="[Könfox] Telemetry/Glean disabled:",
+    )
+
+    return touched
+
+
 def patch_bootstrapped_windows_rs(windows_rs_dir: Path, dry_run: bool) -> list[str]:
     """
     Belt-and-suspenders patch for Mozilla's bootstrapped `~/.mozbuild/windows-rs`
@@ -4798,6 +4997,7 @@ def main() -> int:
         ("IPC (MSCOM/ShMem) & Neqo HTTP/3 Win7 fixes", lambda: patch_ipc_and_networking_win7(args.firefox_dir, args.dry_run)),
         ("Win7 SVG titlebar caption icons (min/max/restore/close)", lambda: patch_win7_titlebar_icons(args.firefox_dir, args.dry_run)),
         ("Remove all AI / ML / GenAI features & AI Controls UI", lambda: patch_remove_ai_features(args.firefox_dir, args.dry_run)),
+        ("Own AppData\\Konfox dir, Win7 launcher guard & complete telemetry removal", lambda: patch_konfox_profile_launcher_and_telemetry(args.firefox_dir, args.dry_run)),
         ("patches/series", lambda: apply_patch_series(args.firefox_dir, args.patches_dir, args.dry_run)),
     ):
         touched = fn()

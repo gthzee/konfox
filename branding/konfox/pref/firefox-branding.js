@@ -99,3 +99,52 @@ pref("browser.translations.quickAction.enabled", false);
 pref("browser.translations.automaticallyPopup", false);
 
 pref("sidebar.main.tools", "opentabs,bookmarks,history,syncedtabs,passwords");
+
+// ---------------------------------------------------------------------------
+// Könfox: Disable Win10+ launcher process & ALL Telemetry / Glean / Studies
+// ---------------------------------------------------------------------------
+pref("browser.launcherProcess.enabled", false);
+
+// Data reporting / healthreport / Glean / usage telemetry
+pref("datareporting.policy.dataSubmissionEnabled", false);
+pref("datareporting.policy.dataSubmissionPolicyBypassNotification", true);
+pref("datareporting.healthreport.uploadEnabled", false);
+pref("datareporting.usage.uploadEnabled", false);
+
+// Legacy Telemetry & LateWriteChecks (prevents Telemetry.LateWriteFinal-* & Telemetry.ShutdownTime.txt)
+pref("toolkit.telemetry.enabled", false);
+pref("toolkit.telemetry.unified", false);
+pref("toolkit.telemetry.archive.enabled", false);
+pref("toolkit.telemetry.newProfilePing.enabled", false);
+pref("toolkit.telemetry.shutdownPingSender.enabled", false);
+pref("toolkit.telemetry.shutdownPingSender.enabledFirstSession", false);
+pref("toolkit.telemetry.updatePing.enabled", false);
+pref("toolkit.telemetry.bhrPing.enabled", false);
+pref("toolkit.telemetry.firstShutdownPing.enabled", false);
+pref("toolkit.telemetry.pioneer-new-studies-available", false);
+pref("toolkit.telemetry.server", "");
+pref("toolkit.telemetry.coverage.opt-out", true);
+pref("toolkit.coverage.opt-out", true);
+pref("toolkit.coverage.endpoint.base", "");
+pref("toolkit.shutdown.lateWriteChecksStage", 0);
+
+// Glean / FOG
+pref("telemetry.fog.test.localhost_port", 0);
+pref("telemetry.fog.enable_store_submitted_pings", false);
+pref("telemetry.glean.internal.finalInactive", false);
+
+// Normandy / Shield Studies / Nimbus / PingCentre / Activity Stream telemetry
+pref("app.shield.optoutstudies.enabled", false);
+pref("app.normandy.enabled", false);
+pref("app.normandy.api_url", "");
+pref("browser.ping-centre.telemetry", false);
+pref("browser.newtabpage.activity-stream.feeds.telemetry", false);
+pref("browser.newtabpage.activity-stream.telemetry", false);
+pref("browser.newtabpage.activity-stream.telemetry.structuredIngestion.endpoint", "");
+pref("browser.discovery.enabled", false);
+
+// Crash reporter & default browser agent telemetry
+pref("breakpad.reportURL", "");
+pref("browser.tabs.crashReporting.sendReport", false);
+pref("browser.crashReports.unsubmittedCheck.autoSubmit2", false);
+pref("default-browser-agent.enabled", false);

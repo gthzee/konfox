@@ -1286,6 +1286,117 @@ class KonfoxToolchainTests(unittest.TestCase):
             self.assertEqual(apply_win7_patches.patch_winrt_and_widget_win7(ff, False), [])
             self.assertEqual(apply_win7_patches.patch_ipc_and_networking_win7(ff, False), [])
 
+    def test_step28_profile_launcher_and_telemetry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ff = Path(tmp) / "firefox"
+            files = {
+                "browser/app/winlauncher/LauncherProcessWin.cpp": (
+                    "Maybe<int> LauncherMain(int& argc, wchar_t* argv[]) {\n"
+                    "  // Called from the launcher process *and* the browser process.\n"
+                    "  EnablePreferLoadFromSystem32IfCompatible();\n"
+                    "  return Nothing();\n"
+                    "}\n"
+                ),
+                "browser/moz.configure": (
+                    'imply_option("MOZ_APP_VENDOR", "Mozilla")\n'
+                    'imply_option("MOZ_APP_ID", "{ec8030f7-c20a-464f-9b0e-13a3a9e97384}")\n'
+                ),
+                "mozglue/misc/PreXULSkeletonUI.cpp": (
+                    "  std::wstring profileDbPath(roamingAppData.get());\n"
+                    "  profileDbPath.append(\n"
+                    '      L"\\\\" MOZ_APP_VENDOR L"\\\\" MOZ_APP_BASENAME L"\\\\profiles.ini");\n'
+                ),
+                "toolkit/crashreporter/crash_helper_server/src/logging/env.rs": (
+                    '        } else if #[cfg(target_os = "windows")] {\n'
+                    '            Some(home_dir.join("AppData").join("Roaming").join(config::MOZ_APP_VENDOR).join(config::MOZ_APP_BASENAME))\n'
+                    "        }\n"
+                ),
+                "xpcom/build/LateWriteChecks.cpp": (
+                    "void InitLateWriteChecks() {\n"
+                    "  sLateWriteObserver = nullptr;\n"
+                    "}\n\n"
+                    "void BeginLateWriteChecks() {\n"
+                    "  if (sLateWriteObserver) {}\n"
+                    "}\n"
+                ),
+                "toolkit/components/telemetry/core/Telemetry.cpp": (
+                    "NS_IMETHODIMP\n"
+                    "TelemetryImpl::SetCanRecordBase(bool canRecord) {\n"
+                    "  mCanRecordBase = canRecord;\n"
+                    "  return NS_OK;\n"
+                    "}\n\n"
+                    "NS_IMETHODIMP\n"
+                    "TelemetryImpl::SetCanRecordExtended(bool canRecord) {\n"
+                    "  mCanRecordExtended = canRecord;\n"
+                    "  return NS_OK;\n"
+                    "}\n"
+                ),
+                "toolkit/components/glean/xpcom/FOG.cpp": (
+                    "void FOG::Shutdown() {\n"
+                    "  MOZ_ASSERT(XRE_IsParentProcess());\n"
+                    "\n"
+                    "  if (mIsShutdown) {\n"
+                    "    return;\n"
+                    "  }\n"
+                    "\n"
+                    "  UnregisterWeakMemoryReporter(this);\n"
+                    "  glean::impl::fog_shutdown();\n"
+                    "}\n\n"
+                    "NS_IMETHODIMP\n"
+                    "FOG::InitializeFOG(const nsACString& aDataPathOverride,\n"
+                    "                   const nsACString& aAppIdOverride,\n"
+                    "                   const bool aDisableInternalPings) {\n"
+                    "  MOZ_ASSERT(XRE_IsParentProcess());\n"
+                    "  gInitializeCalled = true;\n"
+                    "  return NS_OK;\n"
+                    "}\n"
+                ),
+            }
+            for rel, content in files.items():
+                p = ff / rel
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(content, encoding="utf-8")
+
+            touched = apply_win7_patches.patch_konfox_profile_launcher_and_telemetry(ff, False)
+            self.assertEqual(len(touched), 7)
+
+            self.assertIn("if (!mozilla::IsWin8OrLater())", (ff / "browser/app/winlauncher/LauncherProcessWin.cpp").read_text(encoding="utf-8"))
+            bm = (ff / "browser/moz.configure").read_text(encoding="utf-8")
+            self.assertIn('imply_option("MOZ_APP_VENDOR", "Konfox")', bm)
+            self.assertIn('imply_option("MOZ_APP_PROFILE", "Konfox")', bm)
+            self.assertIn('L"\\\\" MOZ_APP_BASENAME L"\\\\profiles.ini"', (ff / "mozglue/misc/PreXULSkeletonUI.cpp").read_text(encoding="utf-8"))
+            self.assertNotIn("MOZ_APP_VENDOR", (ff / "toolkit/crashreporter/crash_helper_server/src/logging/env.rs").read_text(encoding="utf-8"))
+            lwc = (ff / "xpcom/build/LateWriteChecks.cpp").read_text(encoding="utf-8")
+            self.assertIn("never write Telemetry.LateWriteFinal-* files", lwc)
+            self.assertIn("never register late-write IO interposer", lwc)
+            tel = (ff / "toolkit/components/telemetry/core/Telemetry.cpp").read_text(encoding="utf-8")
+            self.assertEqual(tel.count("[Könfox] Telemetry completely disabled."), 2)
+            fog = (ff / "toolkit/components/glean/xpcom/FOG.cpp").read_text(encoding="utf-8")
+            self.assertIn("sKonfoxFogSkipped = true;", fog)
+            self.assertIn("if (sKonfoxFogSkipped)", fog)
+
+            # Check mozconfigs and branding prefs
+            root = Path(__file__).resolve().parent.parent
+            for mc_name in ("mozconfigs/konfox-fast-win64.mozconfig", "mozconfigs/konfox-nightly-win64.mozconfig"):
+                mc = (root / mc_name).read_text(encoding="utf-8")
+                self.assertIn("ac_add_options --disable-launcher-process", mc)
+                self.assertIn("ac_add_options --disable-legacy-profile-creation", mc)
+                self.assertIn("ac_add_options MOZ_TELEMETRY_REPORTING=", mc)
+
+            bjs = (root / "branding/konfox/pref/firefox-branding.js").read_text(encoding="utf-8")
+            for key in (
+                'pref("browser.launcherProcess.enabled", false);',
+                'pref("datareporting.policy.dataSubmissionEnabled", false);',
+                'pref("datareporting.healthreport.uploadEnabled", false);',
+                'pref("toolkit.telemetry.enabled", false);',
+                'pref("toolkit.telemetry.unified", false);',
+                'pref("toolkit.shutdown.lateWriteChecksStage", 0);',
+            ):
+                self.assertIn(key, bjs)
+
+            # Pass 2: 100% idempotent
+            self.assertEqual(apply_win7_patches.patch_konfox_profile_launcher_and_telemetry(ff, False), [])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

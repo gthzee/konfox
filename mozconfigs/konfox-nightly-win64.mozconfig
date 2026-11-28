@@ -32,6 +32,12 @@ ac_add_options --without-onnx-runtime
 # Disable Win8+/10+ push-notification helper (WinHttpWebSocket*) and Toast COM server
 ac_add_options --disable-push-notification-helper
 ac_add_options --disable-notification-server
+# Disable Win10+ out-of-process launcher (prevents Win7 EventID 2 DllBlocklistInit.cpp:58)
+ac_add_options --disable-launcher-process
+# Single profile only (do not create the extra legacy "default" placeholder profile)
+ac_add_options --disable-legacy-profile-creation
+# Disable compile-time telemetry reporting
+ac_add_options MOZ_TELEMETRY_REPORTING=
 export MOZ_LTO=cross
 ac_add_options --enable-js-shell
 
